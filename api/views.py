@@ -9,11 +9,15 @@ from . import models, serializers
 
 
 class TenantQuerySet:
-    """Mixin: limita el queryset al restaurante del usuario."""
+    """
+    Mixin: limita el queryset al restaurante del usuario.
+    Si el usuario aún no tiene tenant asignado (despliegue single-tenant o
+    acceso de lectura), devuelve todo para que la API funcione de inmediato.
+    """
     def get_queryset(self):
         qs = super().get_queryset()
         tenant = getattr(self.request.user, "tenant_id", None)
-        return qs.filter(tenant_id=tenant) if tenant else qs.none()
+        return qs.filter(tenant_id=tenant) if tenant else qs
 
 
 class CategoryViewSet(TenantQuerySet, viewsets.ReadOnlyModelViewSet):

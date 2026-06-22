@@ -120,7 +120,7 @@ class Order(TenantScoped):
     status = models.CharField(max_length=12, choices=STATUS, default="pending")
     customer = models.CharField(max_length=120, blank=True)
     phone = models.CharField(max_length=30, blank=True)
-    receipt = models.ImageField(upload_to="receipts/", null=True, blank=True)
+    receipt = models.FileField(upload_to="receipts/", null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
 

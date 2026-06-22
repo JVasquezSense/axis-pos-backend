@@ -74,9 +74,8 @@ El backend está listo para Railway (Nixpacks + Procfile + railway.json).
 
 > Sin Postgres usa SQLite y sin Redis usa una capa de canales en memoria, así el
 > servicio **arranca aunque aún no agregues plugins**. Para producción real añade
-> ambos. Falta generar las migraciones (`makemigrations`) la primera vez:
-> `python manage.py makemigrations api` antes del primer deploy, o se ejecuta
-> localmente y se commitea la carpeta `api/migrations/`.
+> ambos. Las migraciones (`api/migrations/0001_initial.py`) ya están incluidas, así
+> que el deploy crea las tablas sin pasos manuales.
 
 ## Conectar el frontend (Vercel)
 En el proyecto Next.js define las variables y redeploy:
