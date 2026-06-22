@@ -69,8 +69,12 @@ El backend está listo para Railway (Nixpacks + Procfile + railway.json).
 6. Carga datos demo desde la consola del servicio:
    ```
    python manage.py seed
-   python manage.py createsuperuser
    ```
+   Crea un **usuario para iniciar sesión** y el restaurante demo:
+   - Usuario: `admin@axispos.co`
+   - Contraseña: `Axis2026!`  ← cámbiala en producción
+
+   (Usa `python manage.py createsuperuser` si quieres otro admin.)
 
 > Sin Postgres usa SQLite y sin Redis usa una capa de canales en memoria, así el
 > servicio **arranca aunque aún no agregues plugins**. Para producción real añade
