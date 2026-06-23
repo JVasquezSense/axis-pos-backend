@@ -103,7 +103,11 @@ REST_FRAMEWORK = {
 
 CORS_ALLOWED_ORIGINS = env.list(
     "CORS_ALLOWED_ORIGINS",
-    default=["http://localhost:3000", "https://axispos.co"],
+    default=[
+        "http://localhost:3000",
+        "https://axispos.co",
+        "https://axis-pos-nine.vercel.app",
+    ],
 )
 
 AUTH_PASSWORD_VALIDATORS = [
