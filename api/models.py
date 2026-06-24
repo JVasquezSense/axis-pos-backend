@@ -14,7 +14,7 @@ class Tenant(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=120)
-    logo = models.CharField(max_length=8, default="🍔")
+    logo = models.TextField(default="🍔")
     plan = models.CharField(max_length=20, choices=PLAN, default="starter")
     status = models.CharField(max_length=20, choices=STATUS, default="trial")
     city = models.CharField(max_length=80, blank=True)
@@ -45,7 +45,7 @@ class Product(TenantScoped):
     description = models.TextField(blank=True)
     price = models.DecimalField(max_digits=12, decimal_places=2)
     category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name="products")
-    image = models.CharField(max_length=8, default="🍽️")
+    image = models.TextField(default="🍽️")
     tags = models.JSONField(default=list)
     available = models.BooleanField(default=True)
     prep_minutes = models.PositiveIntegerField(default=10)
@@ -87,7 +87,7 @@ class InventoryMovement(TenantScoped):
 class Recipe(TenantScoped):
     STATION = [("grill", "Parrilla"), ("fry", "Freidora"), ("cold", "Fríos"), ("bar", "Barra"), ("pastry", "Pastelería")]
     name = models.CharField(max_length=120)
-    emoji = models.CharField(max_length=8, default="🍽️")
+    emoji = models.TextField(default="🍽️")
     product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.SET_NULL, related_name="recipes")
     station = models.CharField(max_length=12, choices=STATION, default="grill")
     portions = models.PositiveIntegerField(default=1)
