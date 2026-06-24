@@ -142,3 +142,79 @@ class Customer(TenantScoped):
     points = models.PositiveIntegerField(default=0)
     tier = models.CharField(max_length=12, choices=TIER, default="bronze")
     last_visit = models.DateField(null=True, blank=True)
+
+
+# ─── Proveedores ──────────────────────────────────────────────────────────────
+
+class Supplier(TenantScoped):
+    name = models.CharField(max_length=120)
+    contact = models.CharField(max_length=120, blank=True)
+    phone = models.CharField(max_length=30, blank=True)
+    email = models.EmailField(blank=True)
+    category = models.CharField(max_length=40, default="Abarrotes")
+    nit = models.CharField(max_length=30, blank=True)
+    active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return self.name
+
+
+class Purchase(TenantScoped):
+    code = models.CharField(max_length=20)
+    supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name="purchases")
+    date = models.DateField(auto_now_add=True)
+    total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    invoice_photo = models.TextField(blank=True)  # base64 data URL
+
+    def __str__(self):
+        return self.code
+
+
+class PurchaseLine(models.Model):
+    purchase = models.ForeignKey(Purchase, on_delete=models.CASCADE, related_name="lines")
+    inventory_item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT)
+    quantity = models.DecimalField(max_digits=12, decimal_places=3)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2)
+    unit = models.CharField(max_length=16, blank=True)
+
+
+# ─── Reservaciones ───────────────────────────────────────────────────────────
+
+class Reservation(TenantScoped):
+    STATUS = [
+        ("pending", "Pendiente"), ("confirmed", "Confirmada"),
+        ("arrived", "Llegó"), ("cancelled", "Cancelada"),
+    ]
+    name = models.CharField(max_length=120)
+    phone = models.CharField(max_length=30, blank=True)
+    table_number = models.PositiveIntegerField(default=1)
+    date = models.DateField()
+    time = models.TimeField()
+    guests = models.PositiveIntegerField(default=2)
+    notes = models.TextField(blank=True)
+    status = models.CharField(max_length=12, choices=STATUS, default="pending")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.name} {self.date} {self.time}"
+
+
+# ─── Ventas (registro POS) ───────────────────────────────────────────────────
+
+class Sale(TenantScoped):
+    """Registro de ventas completadas desde el POS."""
+    METHODS = [
+        ("card", "Tarjeta"), ("cash", "Efectivo"),
+        ("transfer", "Transferencia"), ("nequi", "Nequi"),
+    ]
+    total = models.DecimalField(max_digits=14, decimal_places=2)
+    items = models.PositiveIntegerField(default=0)
+    method = models.CharField(max_length=20, choices=METHODS, default="cash")
+    sale_type = models.CharField(max_length=80, blank=True)
+    table_number = models.PositiveIntegerField(null=True, blank=True)
+    tip = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    waiter = models.CharField(max_length=80, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Venta {self.id} ${self.total}"

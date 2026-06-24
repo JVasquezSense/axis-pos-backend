@@ -11,5 +11,10 @@ for model in (
     models.Table,
     models.Order,
     models.Customer,
+    models.Supplier,
+    models.Purchase,
+    models.PurchaseLine,
+    models.Reservation,
+    models.Sale,
 ):
     admin.site.register(model)

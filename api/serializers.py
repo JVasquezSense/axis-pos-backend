@@ -84,7 +84,7 @@ class RecipeIngredientSerializer(serializers.ModelSerializer):
 
 class RecipeSerializer(serializers.ModelSerializer):
     ingredients = RecipeIngredientSerializer(many=True)
-    productId = serializers.PrimaryKeyRelatedField(source="product", queryset=models.Product.objects.all(), required=False)
+    productId = serializers.PrimaryKeyRelatedField(source="product", queryset=models.Product.objects.all(), required=False, allow_null=True)
 
     class Meta:
         model = models.Recipe
@@ -96,3 +96,95 @@ class RecipeSerializer(serializers.ModelSerializer):
         for ing in ingredients:
             models.RecipeIngredient.objects.create(recipe=recipe, **ing)
         return recipe
+
+    def update(self, instance, validated_data):
+        ingredients = validated_data.pop("ingredients", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        if ingredients is not None:
+            instance.ingredients.all().delete()
+            for ing in ingredients:
+                models.RecipeIngredient.objects.create(recipe=instance, **ing)
+        return instance
+
+
+# ─── Proveedores ──────────────────────────────────────────────────────────────
+
+class SupplierSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Supplier
+        fields = ["id", "name", "contact", "phone", "email", "category", "nit", "active"]
+
+
+class PurchaseLineSerializer(serializers.ModelSerializer):
+    inventoryId = serializers.PrimaryKeyRelatedField(
+        source="inventory_item", queryset=models.InventoryItem.objects.all()
+    )
+    unitCost = serializers.DecimalField(source="unit_cost", max_digits=12, decimal_places=2)
+    name = serializers.CharField(source="inventory_item.name", read_only=True)
+
+    class Meta:
+        model = models.PurchaseLine
+        fields = ["id", "inventoryId", "name", "quantity", "unit", "unitCost"]
+
+
+class PurchaseSerializer(serializers.ModelSerializer):
+    lines = PurchaseLineSerializer(many=True)
+    supplierId = serializers.PrimaryKeyRelatedField(
+        source="supplier", queryset=models.Supplier.objects.all(), write_only=True
+    )
+    supplierName = serializers.CharField(source="supplier.name", read_only=True)
+    invoicePhoto = serializers.CharField(source="invoice_photo", required=False, allow_blank=True, default="")
+
+    class Meta:
+        model = models.Purchase
+        fields = ["id", "code", "supplierId", "supplierName", "date", "total", "lines", "invoicePhoto"]
+        read_only_fields = ["date", "supplierName"]
+
+    def create(self, validated_data):
+        lines_data = validated_data.pop("lines", [])
+        purchase = models.Purchase.objects.create(**validated_data)
+        for line_data in lines_data:
+            inv_item = line_data.pop("inventory_item")
+            pl = models.PurchaseLine.objects.create(
+                purchase=purchase, inventory_item=inv_item, **line_data
+            )
+            # Actualiza stock en inventario y crea movimiento
+            inv_item.stock = float(inv_item.stock) + float(pl.quantity)
+            inv_item.recompute_status()
+            inv_item.save()
+            models.InventoryMovement.objects.create(
+                tenant=purchase.tenant,
+                item=inv_item,
+                type="entrada",
+                quantity=pl.quantity,
+                balance=inv_item.stock,
+                unit_cost=pl.unit_cost,
+                reason=f"Compra {purchase.code} · {purchase.supplier.name}",
+            )
+        return purchase
+
+
+# ─── Reservaciones ───────────────────────────────────────────────────────────
+
+class ReservationSerializer(serializers.ModelSerializer):
+    tableNumber = serializers.IntegerField(source="table_number")
+
+    class Meta:
+        model = models.Reservation
+        fields = ["id", "name", "phone", "tableNumber", "date", "time", "guests", "notes", "status"]
+
+
+# ─── Ventas ──────────────────────────────────────────────────────────────────
+
+class SaleSerializer(serializers.ModelSerializer):
+    saleType = serializers.CharField(source="sale_type")
+    table = serializers.IntegerField(source="table_number", allow_null=True)
+    waiter = serializers.CharField(allow_blank=True)
+    ts = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = models.Sale
+        fields = ["id", "total", "items", "method", "saleType", "table", "tip", "waiter", "ts"]
+        read_only_fields = ["ts"]

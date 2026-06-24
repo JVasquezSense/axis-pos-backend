@@ -9,5 +9,9 @@ router.register("tables", views.TableViewSet, basename="table")
 router.register("recipes", views.RecipeViewSet, basename="recipe")
 router.register("customers", views.CustomerViewSet, basename="customer")
 router.register("orders", views.OrderViewSet, basename="order")
+router.register("suppliers", views.SupplierViewSet, basename="supplier")
+router.register("purchases", views.PurchaseViewSet, basename="purchase")
+router.register("reservations", views.ReservationViewSet, basename="reservation")
+router.register("sales", views.SaleViewSet, basename="sale")
 
 urlpatterns = router.urls
