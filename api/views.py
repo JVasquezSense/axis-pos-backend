@@ -21,16 +21,26 @@ class TenantQuerySet:
     def _resolve_tenant_id(self):
         tenant_id = getattr(self.request.user, "tenant_id", None)
         if not tenant_id:
+            try:
+                tenant_id = self.request.user.profile.tenant_id
+            except Exception:
+                pass
+        if not tenant_id:
             first = models.Tenant.objects.first()
             tenant_id = first.pk if first else None
         return tenant_id
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # Intenta tenant del perfil primero
         tenant_id = getattr(self.request.user, "tenant_id", None)
+        if not tenant_id:
+            try:
+                tenant_id = self.request.user.profile.tenant_id
+            except Exception:
+                pass
         if tenant_id:
             return qs.filter(tenant_id=tenant_id)
-        # superadmin sin tenant: filtra por el primer tenant si existe
         first = models.Tenant.objects.first()
         return qs.filter(tenant_id=first.pk) if first else qs
 
@@ -172,6 +182,40 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
         tenant.features = {**tenant.features, **features}
         tenant.save(update_fields=["features"])
         return response.Response(serializers.TenantAdminSerializer(tenant).data)
+
+    @decorators.action(detail=True, methods=["get", "post"], url_path="users", url_name="users")
+    def users(self, request, pk=None):
+        tenant = self.get_object()
+        if request.method == "GET":
+            qs = models.UserProfile.objects.filter(tenant=tenant).select_related("user")
+            users = [p.user for p in qs]
+            return response.Response(serializers.TenantUserSerializer(users, many=True).data)
+        # POST — crear usuario
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        username = request.data.get("username", "").strip()
+        email = request.data.get("email", "").strip()
+        password = request.data.get("password", "")
+        role = request.data.get("role", "admin")
+        if not username or not password:
+            return response.Response({"error": "username y password requeridos"}, status=status.HTTP_400_BAD_REQUEST)
+        if User.objects.filter(username=username).exists():
+            return response.Response({"error": f"El usuario '{username}' ya existe"}, status=status.HTTP_400_BAD_REQUEST)
+        user = User.objects.create_user(username=username, email=email, password=password)
+        models.UserProfile.objects.create(user=user, tenant=tenant, role=role)
+        return response.Response(serializers.TenantUserSerializer(user).data, status=status.HTTP_201_CREATED)
+
+    @decorators.action(detail=True, methods=["delete"], url_path="users/(?P<user_id>[^/.]+)")
+    def delete_user(self, request, pk=None, user_id=None):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        tenant = self.get_object()
+        try:
+            profile = models.UserProfile.objects.get(tenant=tenant, user_id=user_id)
+            profile.user.delete()
+            return response.Response(status=status.HTTP_204_NO_CONTENT)
+        except models.UserProfile.DoesNotExist:
+            return response.Response({"error": "Usuario no encontrado"}, status=status.HTTP_404_NOT_FOUND)
 
 
 class AdminMetricsView(drf_views.APIView):
