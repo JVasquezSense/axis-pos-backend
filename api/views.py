@@ -2,7 +2,7 @@
 ViewSets DRF. Cada uno filtra por el tenant del usuario autenticado
 (aislamiento multi-tenant) y mapea a los endpoints que el frontend ya llama.
 """
-from rest_framework import viewsets, decorators, response, status, views as drf_views
+from rest_framework import viewsets, decorators, response, status, views as drf_views, permissions
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.db.models import Sum, Count, F
@@ -173,6 +173,7 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
     """CRUD completo de tenants. Solo superadmin debe acceder."""
     queryset = models.Tenant.objects.all().order_by("-created_at")
     serializer_class = serializers.TenantAdminSerializer
+    permission_classes = [permissions.IsAdminUser]
 
     @decorators.action(detail=True, methods=["patch"], url_path="features")
     def update_features(self, request, pk=None):
