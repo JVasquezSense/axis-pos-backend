@@ -3,6 +3,7 @@ from . import models
 
 for model in (
     models.Tenant,
+    models.UserProfile,
     models.Category,
     models.Product,
     models.InventoryItem,
