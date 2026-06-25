@@ -218,17 +218,51 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
             "is_active": user.is_active,
         }, status=status.HTTP_201_CREATED)
 
-    @decorators.action(detail=True, methods=["delete"], url_path="users/(?P<user_id>[^/.]+)")
-    def delete_user(self, request, pk=None, user_id=None):
+    @decorators.action(detail=True, methods=["patch", "delete"], url_path="users/(?P<user_id>[^/.]+)", url_name="user-detail")
+    def user_detail(self, request, pk=None, user_id=None):
         from django.contrib.auth import get_user_model
         User = get_user_model()
         tenant = self.get_object()
         try:
-            profile = models.UserProfile.objects.get(tenant=tenant, user_id=user_id)
-            profile.user.delete()
-            return response.Response(status=status.HTTP_204_NO_CONTENT)
+            profile = models.UserProfile.objects.select_related("user").get(tenant=tenant, user_id=user_id)
         except models.UserProfile.DoesNotExist:
             return response.Response({"error": "Usuario no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == "DELETE":
+            profile.user.delete()
+            return response.Response(status=status.HTTP_204_NO_CONTENT)
+
+        # PATCH — actualizar usuario
+        user = profile.user
+        try:
+            with transaction.atomic():
+                if "username" in request.data:
+                    new_username = request.data["username"].strip()
+                    if new_username and new_username != user.username:
+                        if User.objects.filter(username=new_username).exclude(pk=user.pk).exists():
+                            return response.Response({"error": f"El usuario '{new_username}' ya existe"}, status=status.HTTP_400_BAD_REQUEST)
+                        user.username = new_username
+                if "email" in request.data:
+                    user.email = request.data["email"].strip()
+                if "password" in request.data and request.data["password"]:
+                    pwd = request.data["password"]
+                    if len(pwd) < 8:
+                        return response.Response({"error": "La contraseña debe tener al menos 8 caracteres"}, status=status.HTTP_400_BAD_REQUEST)
+                    user.set_password(pwd)
+                user.save()
+                if "role" in request.data:
+                    profile.role = request.data["role"]
+                    profile.save(update_fields=["role"])
+        except Exception as e:
+            return response.Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return response.Response({
+            "id": user.pk,
+            "username": user.username,
+            "email": user.email,
+            "role": profile.role,
+            "is_active": user.is_active,
+        })
 
 
 class AdminMetricsView(drf_views.APIView):
