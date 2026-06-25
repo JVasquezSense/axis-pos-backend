@@ -8,6 +8,7 @@ from channels.layers import get_channel_layer
 from django.db.models import Sum, Count, F
 from django.db.models.functions import TruncDate, ExtractHour
 from django.utils import timezone
+from django.db import transaction
 from datetime import timedelta
 from . import models, serializers
 
@@ -199,11 +200,23 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
         role = request.data.get("role", "admin")
         if not username or not password:
             return response.Response({"error": "username y password requeridos"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(password) < 8:
+            return response.Response({"error": "La contraseña debe tener al menos 8 caracteres"}, status=status.HTTP_400_BAD_REQUEST)
         if User.objects.filter(username=username).exists():
             return response.Response({"error": f"El usuario '{username}' ya existe"}, status=status.HTTP_400_BAD_REQUEST)
-        user = User.objects.create_user(username=username, email=email, password=password)
-        models.UserProfile.objects.create(user=user, tenant=tenant, role=role)
-        return response.Response(serializers.TenantUserSerializer(user).data, status=status.HTTP_201_CREATED)
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(username=username, email=email, password=password)
+                profile = models.UserProfile.objects.create(user=user, tenant=tenant, role=role)
+        except Exception as e:
+            return response.Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return response.Response({
+            "id": user.pk,
+            "username": user.username,
+            "email": user.email,
+            "role": profile.role,
+            "is_active": user.is_active,
+        }, status=status.HTTP_201_CREATED)
 
     @decorators.action(detail=True, methods=["delete"], url_path="users/(?P<user_id>[^/.]+)")
     def delete_user(self, request, pk=None, user_id=None):
