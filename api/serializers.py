@@ -218,7 +218,7 @@ class TenantUserSerializer(serializers.Serializer):
                 pass
             return {
                 "id": instance.pk,
-                "username": instance.username,
+                "username": instance.first_name or instance.email,
                 "email": instance.email,
                 "role": role,
                 "is_active": instance.is_active,

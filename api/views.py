@@ -198,21 +198,25 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
         email = request.data.get("email", "").strip()
         password = request.data.get("password", "")
         role = request.data.get("role", "admin")
-        if not username or not password:
-            return response.Response({"error": "username y password requeridos"}, status=status.HTTP_400_BAD_REQUEST)
+        if not email or not password:
+            return response.Response({"error": "email y password requeridos"}, status=status.HTTP_400_BAD_REQUEST)
         if len(password) < 8:
             return response.Response({"error": "La contraseña debe tener al menos 8 caracteres"}, status=status.HTTP_400_BAD_REQUEST)
-        if User.objects.filter(username=username).exists():
-            return response.Response({"error": f"El usuario '{username}' ya existe"}, status=status.HTTP_400_BAD_REQUEST)
+        if User.objects.filter(username=email).exists():
+            return response.Response({"error": f"Ya existe un usuario con el email '{email}'"}, status=status.HTTP_400_BAD_REQUEST)
         try:
             with transaction.atomic():
-                user = User.objects.create_user(username=username, email=email, password=password)
+                # username = email para que el JWT login funcione con el campo email del formulario
+                user = User.objects.create_user(username=email, email=email, password=password)
+                if username:
+                    user.first_name = username
+                    user.save(update_fields=["first_name"])
                 profile = models.UserProfile.objects.create(user=user, tenant=tenant, role=role)
         except Exception as e:
             return response.Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return response.Response({
             "id": user.pk,
-            "username": user.username,
+            "username": user.first_name or user.email,
             "email": user.email,
             "role": profile.role,
             "is_active": user.is_active,
@@ -237,13 +241,15 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
         try:
             with transaction.atomic():
                 if "username" in request.data:
-                    new_username = request.data["username"].strip()
-                    if new_username and new_username != user.username:
-                        if User.objects.filter(username=new_username).exclude(pk=user.pk).exists():
-                            return response.Response({"error": f"El usuario '{new_username}' ya existe"}, status=status.HTTP_400_BAD_REQUEST)
-                        user.username = new_username
+                    # username es el nombre visible, guardado en first_name
+                    user.first_name = request.data["username"].strip()
                 if "email" in request.data:
-                    user.email = request.data["email"].strip()
+                    new_email = request.data["email"].strip()
+                    if new_email != user.email:
+                        if User.objects.filter(username=new_email).exclude(pk=user.pk).exists():
+                            return response.Response({"error": f"Ya existe un usuario con el email '{new_email}'"}, status=status.HTTP_400_BAD_REQUEST)
+                        user.username = new_email  # username == email para JWT login
+                        user.email = new_email
                 if "password" in request.data and request.data["password"]:
                     pwd = request.data["password"]
                     if len(pwd) < 8:
@@ -258,7 +264,7 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
 
         return response.Response({
             "id": user.pk,
-            "username": user.username,
+            "username": user.first_name or user.email,
             "email": user.email,
             "role": profile.role,
             "is_active": user.is_active,
