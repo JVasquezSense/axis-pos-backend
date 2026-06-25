@@ -62,7 +62,7 @@ class TableSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.Table
-        fields = ["id", "number", "capacity", "zone", "status", "waiter", "seatedAt"]
+        fields = ["id", "number", "capacity", "zone", "status", "waiter", "seatedAt", "x", "y", "shape"]
 
 
 class CustomerSerializer(serializers.ModelSerializer):
@@ -195,6 +195,35 @@ class EmployeeSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Employee
         fields = ["id", "name", "role", "active", "phone", "email"]
+
+
+# ─── Usuarios de tenant ──────────────────────────────────────────────────────
+
+class TenantUserSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    username = serializers.CharField()
+    email = serializers.EmailField()
+    role = serializers.CharField()
+    is_active = serializers.BooleanField(default=True)
+    password = serializers.CharField(write_only=True, required=False)
+
+    def to_representation(self, instance):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        if isinstance(instance, User):
+            role = "admin"
+            try:
+                role = instance.profile.role
+            except Exception:
+                pass
+            return {
+                "id": instance.pk,
+                "username": instance.username,
+                "email": instance.email,
+                "role": role,
+                "is_active": instance.is_active,
+            }
+        return super().to_representation(instance)
 
 
 # ─── Super Admin ─────────────────────────────────────────────────────────────

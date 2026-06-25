@@ -5,6 +5,7 @@ serializers de DRF produzcan exactamente el JSON que la UI ya consume.
 Todo es multi-tenant: cada fila pertenece a un Tenant (restaurante).
 """
 import uuid
+from django.conf import settings
 from django.db import models
 
 
@@ -33,6 +34,16 @@ class Tenant(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class UserProfile(models.Model):
+    ROLE = [("admin","Admin"),("cashier","Cajero"),("waiter","Mesero"),("kitchen","Cocina"),("warehouse","Almacén")]
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile")
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="profiles", null=True, blank=True)
+    role = models.CharField(max_length=20, choices=ROLE, default="admin")
+
+    def __str__(self):
+        return f"{self.user.username} → {self.tenant}"
 
 
 class TenantScoped(models.Model):
@@ -130,12 +141,16 @@ class RecipeIngredient(models.Model):
 
 class Table(TenantScoped):
     STATUS = [("available", "Disponible"), ("occupied", "Ocupada"), ("reserved", "Reservada"), ("billing", "Cuenta")]
+    SHAPE = [("round", "Redonda"), ("square", "Cuadrada"), ("rect", "Rectangular")]
     number = models.PositiveIntegerField()
     capacity = models.PositiveIntegerField(default=4)
     zone = models.CharField(max_length=60, default="Salón")
     status = models.CharField(max_length=12, choices=STATUS, default="available")
     waiter = models.CharField(max_length=80, blank=True)
     seated_at = models.DateTimeField(null=True, blank=True)
+    x = models.FloatField(default=50)
+    y = models.FloatField(default=50)
+    shape = models.CharField(max_length=10, choices=SHAPE, default="square")
 
 
 class Order(TenantScoped):
