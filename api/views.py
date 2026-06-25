@@ -15,16 +15,27 @@ from . import models, serializers
 class TenantQuerySet:
     """
     Mixin: limita el queryset al restaurante del usuario.
-    Si el usuario aún no tiene tenant asignado (despliegue single-tenant o
-    acceso de lectura), devuelve todo para que la API funcione de inmediato.
+    Si el usuario no tiene tenant_id asignado, usa el primer Tenant disponible
+    (setup single-tenant / superadmin sin perfil).
     """
+    def _resolve_tenant_id(self):
+        tenant_id = getattr(self.request.user, "tenant_id", None)
+        if not tenant_id:
+            first = models.Tenant.objects.first()
+            tenant_id = first.pk if first else None
+        return tenant_id
+
     def get_queryset(self):
         qs = super().get_queryset()
-        tenant = getattr(self.request.user, "tenant_id", None)
-        return qs.filter(tenant_id=tenant) if tenant else qs
+        tenant_id = getattr(self.request.user, "tenant_id", None)
+        if tenant_id:
+            return qs.filter(tenant_id=tenant_id)
+        # superadmin sin tenant: filtra por el primer tenant si existe
+        first = models.Tenant.objects.first()
+        return qs.filter(tenant_id=first.pk) if first else qs
 
     def perform_create(self, serializer):
-        tenant_id = getattr(self.request.user, "tenant_id", None)
+        tenant_id = self._resolve_tenant_id()
         if tenant_id:
             serializer.save(tenant_id=tenant_id)
         else:
