@@ -75,20 +75,33 @@ class CustomerSerializer(serializers.ModelSerializer):
 
 
 class RecipeIngredientSerializer(serializers.ModelSerializer):
-    inventoryId = serializers.PrimaryKeyRelatedField(source="item", queryset=models.InventoryItem.objects.all())
+    inventoryId = serializers.PrimaryKeyRelatedField(
+        source="item", queryset=models.InventoryItem.objects.all(), required=False, allow_null=True
+    )
 
     class Meta:
         model = models.RecipeIngredient
-        fields = ["id", "inventoryId", "quantity", "waste"]
+        fields = ["id", "inventoryId", "name", "unit", "quantity", "waste"]
 
 
 class RecipeSerializer(serializers.ModelSerializer):
     ingredients = RecipeIngredientSerializer(many=True)
-    productId = serializers.PrimaryKeyRelatedField(source="product", queryset=models.Product.objects.all(), required=False, allow_null=True)
+    productId = serializers.PrimaryKeyRelatedField(
+        source="product", queryset=models.Product.objects.all(), required=False, allow_null=True
+    )
+    prepMinutes = serializers.IntegerField(source="prep_minutes", default=10)
+    allergensOther = serializers.CharField(source="allergens_other", allow_blank=True, default="")
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
 
     class Meta:
         model = models.Recipe
-        fields = ["id", "name", "emoji", "productId", "station", "portions", "price", "ingredients"]
+        fields = [
+            "id", "name", "emoji", "description", "category",
+            "productId", "station", "status", "difficulty",
+            "portions", "prepMinutes", "price",
+            "ingredients", "variations", "steps",
+            "allergens", "allergensOther", "tags", "updatedAt",
+        ]
 
     def create(self, validated_data):
         ingredients = validated_data.pop("ingredients", [])

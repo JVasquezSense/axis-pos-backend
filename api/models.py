@@ -86,17 +86,33 @@ class InventoryMovement(TenantScoped):
 
 class Recipe(TenantScoped):
     STATION = [("grill", "Parrilla"), ("fry", "Freidora"), ("cold", "Fríos"), ("bar", "Barra"), ("pastry", "Pastelería")]
+    STATUS = [("active", "Activa"), ("draft", "Borrador"), ("archived", "Archivada")]
+    DIFFICULTY = [("easy", "Fácil"), ("medium", "Media"), ("hard", "Difícil")]
+
     name = models.CharField(max_length=120)
     emoji = models.TextField(default="🍽️")
+    description = models.TextField(blank=True)
+    category = models.CharField(max_length=80, blank=True)
     product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.SET_NULL, related_name="recipes")
     station = models.CharField(max_length=12, choices=STATION, default="grill")
+    status = models.CharField(max_length=12, choices=STATUS, default="draft")
+    difficulty = models.CharField(max_length=12, choices=DIFFICULTY, default="easy")
     portions = models.PositiveIntegerField(default=1)
+    prep_minutes = models.PositiveIntegerField(default=10)
     price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    variations = models.JSONField(default=list)
+    steps = models.JSONField(default=list)
+    allergens = models.JSONField(default=list)
+    allergens_other = models.CharField(max_length=200, blank=True)
+    tags = models.JSONField(default=list)
+    updated_at = models.DateTimeField(auto_now=True)
 
 
 class RecipeIngredient(models.Model):
     recipe = models.ForeignKey(Recipe, on_delete=models.CASCADE, related_name="ingredients")
-    item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT)
+    item = models.ForeignKey(InventoryItem, null=True, blank=True, on_delete=models.SET_NULL)
+    name = models.CharField(max_length=120, blank=True)
+    unit = models.CharField(max_length=16, blank=True)
     quantity = models.DecimalField(max_digits=12, decimal_places=3)
     waste = models.FloatField(default=0)  # 0..1
 
