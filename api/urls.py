@@ -13,5 +13,6 @@ router.register("suppliers", views.SupplierViewSet, basename="supplier")
 router.register("purchases", views.PurchaseViewSet, basename="purchase")
 router.register("reservations", views.ReservationViewSet, basename="reservation")
 router.register("sales", views.SaleViewSet, basename="sale")
+router.register("employees", views.EmployeeViewSet, basename="employee")
 
 urlpatterns = router.urls

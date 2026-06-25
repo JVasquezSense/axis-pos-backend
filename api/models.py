@@ -199,6 +199,26 @@ class Reservation(TenantScoped):
         return f"{self.name} {self.date} {self.time}"
 
 
+# ─── Empleados ───────────────────────────────────────────────────────────────
+
+class Employee(TenantScoped):
+    ROLE = [
+        ("mesero", "Mesero"),
+        ("cocinero", "Cocinero"),
+        ("cajero", "Cajero"),
+        ("admin", "Administrador"),
+        ("almacen", "Almacén"),
+    ]
+    name = models.CharField(max_length=120)
+    role = models.CharField(max_length=16, choices=ROLE, default="mesero")
+    active = models.BooleanField(default=True)
+    phone = models.CharField(max_length=30, blank=True)
+    email = models.EmailField(blank=True)
+
+    def __str__(self):
+        return self.name
+
+
 # ─── Ventas (registro POS) ───────────────────────────────────────────────────
 
 class Sale(TenantScoped):

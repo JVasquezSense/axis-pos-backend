@@ -16,5 +16,6 @@ for model in (
     models.PurchaseLine,
     models.Reservation,
     models.Sale,
+    models.Employee,
 ):
     admin.site.register(model)

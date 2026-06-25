@@ -132,6 +132,13 @@ class ReservationViewSet(TenantQuerySet, viewsets.ModelViewSet):
     serializer_class = serializers.ReservationSerializer
 
 
+# ─── Empleados ───────────────────────────────────────────────────────────────
+
+class EmployeeViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    queryset = models.Employee.objects.all().order_by("name")
+    serializer_class = serializers.EmployeeSerializer
+
+
 # ─── Ventas ──────────────────────────────────────────────────────────────────
 
 class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):

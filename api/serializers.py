@@ -176,6 +176,14 @@ class ReservationSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "phone", "tableNumber", "date", "time", "guests", "notes", "status"]
 
 
+# ─── Empleados ───────────────────────────────────────────────────────────────
+
+class EmployeeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Employee
+        fields = ["id", "name", "role", "active", "phone", "email"]
+
+
 # ─── Ventas ──────────────────────────────────────────────────────────────────
 
 class SaleSerializer(serializers.ModelSerializer):
