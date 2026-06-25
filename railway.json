@@ -1,6 +1,8 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
-  "build": {},
+  "build": {
+    "builder": "RAILPACK"
+  },
   "deploy": {
     "startCommand": "daphne -b 0.0.0.0 -p $PORT config.asgi:application",
     "preDeployCommand": "python3 manage.py migrate --noinput && python3 manage.py collectstatic --noinput",
