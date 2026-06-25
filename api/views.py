@@ -2,9 +2,13 @@
 ViewSets DRF. Cada uno filtra por el tenant del usuario autenticado
 (aislamiento multi-tenant) y mapea a los endpoints que el frontend ya llama.
 """
-from rest_framework import viewsets, decorators, response, status
+from rest_framework import viewsets, decorators, response, status, views as drf_views
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
+from django.db.models import Sum, Count, F
+from django.db.models.functions import TruncDate, ExtractHour
+from django.utils import timezone
+from datetime import timedelta
 from . import models, serializers
 
 
@@ -145,3 +149,302 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Sale.objects.all().order_by("-created_at")
     serializer_class = serializers.SaleSerializer
     http_method_names = ["get", "post", "head", "options"]  # read + create only
+
+
+# ─── Analytics ───────────────────────────────────────────────────────────────
+
+def _tenant_qs(model_qs, user):
+    tenant_id = getattr(user, "tenant_id", None)
+    return model_qs.filter(tenant_id=tenant_id) if tenant_id else model_qs
+
+
+def _delta(current, previous):
+    if previous == 0:
+        return 100.0 if current > 0 else 0.0
+    return round((current - previous) / previous * 100, 1)
+
+
+DAYS_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+MONTHS_ES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+COLORS = ["#6366f1", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316"]
+METHOD_LABELS = {"card": "Tarjeta", "cash": "Efectivo", "transfer": "Transferencia", "nequi": "Nequi"}
+
+
+class DashboardView(drf_views.APIView):
+    """GET /api/v1/dashboard/summary/ — métricas en tiempo real."""
+
+    def get(self, request):
+        today = timezone.localdate()
+        yesterday = today - timedelta(days=1)
+
+        sale_qs = _tenant_qs(models.Sale.objects.all(), request.user)
+        inv_qs = _tenant_qs(models.InventoryItem.objects.all(), request.user)
+        table_qs = _tenant_qs(models.Table.objects.all(), request.user)
+        order_qs = _tenant_qs(models.Order.objects.all(), request.user)
+
+        # Daily revenue last 30 days (one query)
+        daily = {
+            r["day"]: float(r["total"])
+            for r in (
+                sale_qs
+                .annotate(day=TruncDate("created_at"))
+                .values("day")
+                .annotate(total=Sum("total"))
+            )
+        }
+        rev_today = daily.get(today, 0.0)
+        rev_yday = daily.get(yesterday, 0.0)
+
+        orders_today = sale_qs.filter(created_at__date=today).count()
+        orders_yday = sale_qs.filter(created_at__date=yesterday).count()
+        avg_today = rev_today / orders_today if orders_today else 0.0
+        avg_yday = rev_yday / orders_yday if orders_yday else 0.0
+
+        # Spark: last 7 days
+        spark_rev = [daily.get(today - timedelta(days=i), 0.0) for i in range(6, -1, -1)]
+        spark_ord = [
+            sale_qs.filter(created_at__date=today - timedelta(days=i)).count()
+            for i in range(6, -1, -1)
+        ]
+
+        critical_count = inv_qs.filter(status="critical").count()
+
+        kpis = [
+            {"id": "revenue", "label": "Ventas Hoy", "value": rev_today, "format": "currency",
+             "delta": _delta(rev_today, rev_yday), "icon": "DollarSign", "spark": spark_rev},
+            {"id": "orders", "label": "Órdenes Hoy", "value": orders_today, "format": "number",
+             "delta": _delta(orders_today, orders_yday), "icon": "ShoppingBag", "spark": spark_ord},
+            {"id": "avg_ticket", "label": "Ticket Promedio", "value": round(avg_today, 0), "format": "currency",
+             "delta": _delta(avg_today, avg_yday), "icon": "Receipt", "spark": spark_rev},
+            {"id": "critical_stock", "label": "Stock Crítico", "value": critical_count, "format": "number",
+             "delta": 0.0, "icon": "AlertTriangle", "spark": [critical_count] * 7},
+        ]
+
+        # Sales by hour (today)
+        hourly = {
+            r["h"]: float(r["total"])
+            for r in (
+                sale_qs
+                .filter(created_at__date=today)
+                .annotate(h=ExtractHour("created_at"))
+                .values("h")
+                .annotate(total=Sum("total"))
+            )
+        }
+        sales_by_hour = [{"label": f"{h:02d}:00", "value": hourly.get(h, 0.0)} for h in range(24)]
+
+        # Sales by day (last 7)
+        sales_by_day = [
+            {"label": DAYS_ES[(today - timedelta(days=i)).weekday()], "value": daily.get(today - timedelta(days=i), 0.0)}
+            for i in range(6, -1, -1)
+        ]
+
+        # Sales vs last year (monthly)
+        current_year = today.year
+        monthly_curr = {
+            r["m"]: float(r["total"])
+            for r in (
+                sale_qs.filter(created_at__year=current_year)
+                .annotate(m=TruncDate("created_at"))
+                .values("created_at__month")
+                .annotate(total=Sum("total"))
+                .values("created_at__month", "total")
+            )
+        }
+        monthly_prev = {
+            r["created_at__month"]: float(r["total"])
+            for r in (
+                sale_qs.filter(created_at__year=current_year - 1)
+                .values("created_at__month")
+                .annotate(total=Sum("total"))
+            )
+        }
+        sales_vs_last_year = [
+            {"label": MONTHS_ES[m - 1], "current": monthly_curr.get(m, 0.0), "previous": monthly_prev.get(m, 0.0)}
+            for m in range(1, 13)
+        ]
+
+        # Top products from OrderLines
+        tenant_id = getattr(request.user, "tenant_id", None)
+        raw_lines = models.OrderLine.objects.filter(order__tenant_id=tenant_id) if tenant_id \
+            else models.OrderLine.objects.all()
+        top_raw = (
+            raw_lines
+            .values("product__id", "product__name", "product__image", "product__category__name")
+            .annotate(units=Sum("quantity"), revenue=Sum(F("quantity") * F("unit_price")))
+            .order_by("-revenue")[:10]
+        )
+        top_products = [
+            {
+                "id": str(r["product__id"]),
+                "name": r["product__name"],
+                "category": r["product__category__name"] or "",
+                "units": r["units"] or 0,
+                "revenue": float(r["revenue"] or 0),
+                "image": r["product__image"] or "🍽️",
+            }
+            for r in top_raw
+        ]
+
+        # Alerts
+        alerts = []
+        for item in inv_qs.filter(status="critical")[:5]:
+            alerts.append({
+                "id": str(item.id), "type": "stock", "severity": "critical",
+                "title": f"Stock crítico: {item.name}",
+                "description": f"Solo {float(item.stock):.1f} {item.unit} (mín: {float(item.min_stock):.1f})",
+                "time": item.updated_at.isoformat(),
+            })
+        for item in inv_qs.filter(status="low")[:3]:
+            alerts.append({
+                "id": f"low-{item.id}", "type": "stock", "severity": "warning",
+                "title": f"Stock bajo: {item.name}",
+                "description": f"{float(item.stock):.1f} {item.unit} disponibles (mín: {float(item.min_stock):.1f})",
+                "time": item.updated_at.isoformat(),
+            })
+
+        occupied = table_qs.filter(status__in=["occupied", "billing"]).count()
+        total_tables = table_qs.count()
+        active_orders = order_qs.filter(status__in=["pending", "preparing"]).count()
+
+        return response.Response({
+            "kpis": kpis,
+            "salesByHour": sales_by_hour,
+            "salesByDay": sales_by_day,
+            "salesVsLastYear": sales_vs_last_year,
+            "topProducts": top_products,
+            "alerts": alerts,
+            "occupancy": {"occupied": occupied, "total": total_tables},
+            "kitchenLoad": {"active": active_orders, "avgMinutes": 15},
+            "criticalStock": critical_count,
+        })
+
+
+class ReportsView(drf_views.APIView):
+    """GET /api/v1/reports/executive/ — resumen ejecutivo últimos 30 días."""
+
+    def get(self, request):
+        today = timezone.localdate()
+        start_30 = today - timedelta(days=29)
+        start_60 = today - timedelta(days=59)
+
+        sale_qs = _tenant_qs(models.Sale.objects.all(), request.user)
+        tenant_id = getattr(request.user, "tenant_id", None)
+        line_qs = models.OrderLine.objects.filter(order__tenant_id=tenant_id) if tenant_id \
+            else models.OrderLine.objects.all()
+
+        curr = sale_qs.filter(created_at__date__gte=start_30)
+        prev = sale_qs.filter(created_at__date__gte=start_60, created_at__date__lt=start_30)
+
+        curr_rev = float(curr.aggregate(t=Sum("total"))["t"] or 0)
+        prev_rev = float(prev.aggregate(t=Sum("total"))["t"] or 0)
+        curr_ord = curr.count()
+        prev_ord = prev.count()
+        curr_avg = curr_rev / curr_ord if curr_ord else 0.0
+        prev_avg = prev_rev / prev_ord if prev_ord else 0.0
+        curr_profit = curr_rev * 0.35
+        prev_profit = prev_rev * 0.35
+
+        # Daily data — one query
+        daily = {
+            r["day"]: float(r["total"])
+            for r in (
+                sale_qs
+                .filter(created_at__date__gte=start_30)
+                .annotate(day=TruncDate("created_at"))
+                .values("day")
+                .annotate(total=Sum("total"))
+            )
+        }
+        spark = [daily.get(today - timedelta(days=i), 0.0) for i in range(6, -1, -1)]
+
+        kpis = [
+            {"id": "revenue", "label": "Ingresos 30d", "value": curr_rev, "format": "currency",
+             "delta": _delta(curr_rev, prev_rev), "icon": "TrendingUp", "spark": spark},
+            {"id": "profit", "label": "Utilidad Est. 30d", "value": round(curr_profit, 0), "format": "currency",
+             "delta": _delta(curr_profit, prev_profit), "icon": "PiggyBank", "spark": [round(v * 0.35, 0) for v in spark]},
+            {"id": "orders", "label": "Órdenes 30d", "value": curr_ord, "format": "number",
+             "delta": _delta(curr_ord, prev_ord), "icon": "ShoppingBag", "spark": spark},
+            {"id": "avg_ticket", "label": "Ticket Promedio", "value": round(curr_avg, 0), "format": "currency",
+             "delta": _delta(curr_avg, prev_avg), "icon": "Receipt", "spark": spark},
+        ]
+
+        revenue_trend = [
+            {"label": (today - timedelta(days=29 - i)).strftime("%d/%m"), "value": daily.get(today - timedelta(days=29 - i), 0.0)}
+            for i in range(30)
+        ]
+        profit_trend = [{"label": p["label"], "value": round(p["value"] * 0.35, 0)} for p in revenue_trend]
+
+        # Category mix from OrderLines
+        cat_agg = (
+            line_qs
+            .filter(order__created_at__date__gte=start_30)
+            .values("product__category__name")
+            .annotate(revenue=Sum(F("quantity") * F("unit_price")))
+            .order_by("-revenue")
+        )
+        category_mix = [
+            {"name": r["product__category__name"] or "Sin categoría", "value": float(r["revenue"] or 0), "color": COLORS[i % len(COLORS)]}
+            for i, r in enumerate(cat_agg)
+        ]
+
+        # Channel mix from Sale.sale_type
+        channel_agg = (
+            curr.values("sale_type").annotate(revenue=Sum("total")).order_by("-revenue")
+        )
+        channel_mix = [
+            {"name": r["sale_type"] or "Mesa", "value": float(r["revenue"] or 0), "color": COLORS[i % len(COLORS)]}
+            for i, r in enumerate(channel_agg)
+        ]
+
+        # Payment mix
+        pay_agg = curr.values("method").annotate(revenue=Sum("total")).order_by("-revenue")
+        payment_mix = [
+            {"name": METHOD_LABELS.get(r["method"], r["method"] or "Otro"), "value": float(r["revenue"] or 0), "color": COLORS[i % len(COLORS)]}
+            for i, r in enumerate(pay_agg)
+        ]
+
+        # Sales by location
+        loc_agg = curr.values("sale_type").annotate(total_rev=Sum("total"), cnt=Count("id")).order_by("-total_rev")
+        sales_by_location = [
+            {"name": r["sale_type"] or "Sin tipo", "value": float(r["total_rev"] or 0), "avg": float(r["total_rev"] or 0) / max(r["cnt"], 1)}
+            for r in loc_agg
+        ]
+
+        # Top dishes from OrderLines
+        top_raw = (
+            line_qs
+            .filter(order__created_at__date__gte=start_30)
+            .values("product__name")
+            .annotate(units=Sum("quantity"), revenue=Sum(F("quantity") * F("unit_price")))
+            .order_by("-revenue")[:10]
+        )
+        top_dishes = [
+            {"name": r["product__name"], "units": r["units"] or 0, "revenue": float(r["revenue"] or 0),
+             "avg": float(r["revenue"] or 0) / max(r["units"] or 1, 1)}
+            for r in top_raw
+        ]
+
+        # Hourly heat (all time)
+        hourly = {
+            r["h"]: float(r["total"])
+            for r in (
+                sale_qs
+                .annotate(h=ExtractHour("created_at"))
+                .values("h")
+                .annotate(total=Sum("total"))
+            )
+        }
+        hourly_heat = [{"label": f"{h:02d}:00", "value": hourly.get(h, 0.0)} for h in range(24)]
+
+        return response.Response({
+            "kpis": kpis,
+            "revenueTrend": revenue_trend,
+            "profitTrend": profit_trend,
+            "categoryMix": category_mix,
+            "channelMix": channel_mix,
+            "paymentMix": payment_mix,
+            "salesByLocation": sales_by_location,
+            "topDishes": top_dishes,
+            "hourlyHeat": hourly_heat,
+        })
