@@ -8,6 +8,15 @@ import uuid
 from django.db import models
 
 
+def _default_features():
+    return {
+        "pos": True, "kitchen": True, "inventory": True,
+        "recipes": True, "salon": True, "reservations": True,
+        "crm": True, "suppliers": True, "employees": True,
+        "reports": True, "website": True, "web_orders": True,
+    }
+
+
 class Tenant(models.Model):
     PLAN = [("starter", "Starter"), ("growth", "Growth"), ("enterprise", "Enterprise")]
     STATUS = [("active", "Activo"), ("trial", "Prueba"), ("past_due", "Mora"), ("churned", "Cancelado")]
@@ -18,6 +27,8 @@ class Tenant(models.Model):
     plan = models.CharField(max_length=20, choices=PLAN, default="starter")
     status = models.CharField(max_length=20, choices=STATUS, default="trial")
     city = models.CharField(max_length=80, blank=True)
+    locations = models.PositiveIntegerField(default=1)
+    features = models.JSONField(default=_default_features)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

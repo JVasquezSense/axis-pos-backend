@@ -197,6 +197,41 @@ class EmployeeSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "role", "active", "phone", "email"]
 
 
+# ─── Super Admin ─────────────────────────────────────────────────────────────
+
+PLAN_MRR = {"starter": 299000, "growth": 599000, "enterprise": 1200000}
+
+
+class TenantAdminSerializer(serializers.ModelSerializer):
+    mrr = serializers.SerializerMethodField()
+    users = serializers.SerializerMethodField()
+    ordersMonth = serializers.SerializerMethodField()
+    joinedAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = models.Tenant
+        fields = [
+            "id", "name", "logo", "plan", "status", "city",
+            "locations", "features",
+            "mrr", "users", "ordersMonth", "joinedAt",
+        ]
+        read_only_fields = ["id", "joinedAt", "mrr", "users", "ordersMonth"]
+
+    def get_mrr(self, obj):
+        return PLAN_MRR.get(obj.plan, 0)
+
+    def get_users(self, obj):
+        from django.contrib.auth import get_user_model
+        return 1  # sin user-tenant FK aún
+
+    def get_ordersMonth(self, obj):
+        from django.utils import timezone
+        now = timezone.now()
+        return models.Sale.objects.filter(
+            tenant=obj, created_at__year=now.year, created_at__month=now.month
+        ).count()
+
+
 # ─── Ventas ──────────────────────────────────────────────────────────────────
 
 class SaleSerializer(serializers.ModelSerializer):

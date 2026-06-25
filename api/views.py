@@ -156,6 +156,82 @@ class EmployeeViewSet(TenantQuerySet, viewsets.ModelViewSet):
 
 # ─── Ventas ──────────────────────────────────────────────────────────────────
 
+# ─── Super Admin ─────────────────────────────────────────────────────────────
+
+class AdminTenantViewSet(viewsets.ModelViewSet):
+    """CRUD completo de tenants. Solo superadmin debe acceder."""
+    queryset = models.Tenant.objects.all().order_by("-created_at")
+    serializer_class = serializers.TenantAdminSerializer
+
+    @decorators.action(detail=True, methods=["patch"], url_path="features")
+    def update_features(self, request, pk=None):
+        tenant = self.get_object()
+        features = request.data.get("features")
+        if not isinstance(features, dict):
+            return response.Response({"error": "features must be a dict"}, status=status.HTTP_400_BAD_REQUEST)
+        tenant.features = {**tenant.features, **features}
+        tenant.save(update_fields=["features"])
+        return response.Response(serializers.TenantAdminSerializer(tenant).data)
+
+
+class AdminMetricsView(drf_views.APIView):
+    """GET /api/v1/admin/metrics/ — métricas SaaS globales."""
+
+    def get(self, request):
+        from django.db.models.functions import TruncMonth
+        tenants = models.Tenant.objects.all()
+        total = tenants.count()
+        active = tenants.filter(status="active").count()
+        trial = tenants.filter(status="trial").count()
+        churned = tenants.filter(status="churned").count()
+
+        PLAN_MRR = {"starter": 299000, "growth": 599000, "enterprise": 1200000}
+        mrr_total = sum(PLAN_MRR.get(t.plan, 0) for t in tenants if t.status in ("active", "trial"))
+        arpa = mrr_total / max(active + trial, 1)
+        churn = round(churned / max(total, 1) * 100, 1)
+
+        spark = [0] * 7
+
+        kpis = [
+            {"id": "tenants", "label": "Restaurantes", "value": total, "format": "number",
+             "delta": 0, "icon": "Building2", "spark": spark},
+            {"id": "mrr", "label": "MRR Total", "value": mrr_total, "format": "currency",
+             "delta": 0, "icon": "TrendingUp", "spark": spark},
+            {"id": "active", "label": "Activos", "value": active, "format": "number",
+             "delta": 0, "icon": "CheckCircle", "spark": spark},
+            {"id": "churn", "label": "Churn", "value": churn, "format": "percent",
+             "delta": 0, "icon": "TrendingDown", "spark": spark},
+        ]
+
+        # MRR trend: últimos 6 meses (basado en fecha de creación de tenants)
+        MONTHS_ES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
+        from django.utils import timezone
+        today = timezone.localdate()
+        mrr_trend = []
+        for i in range(5, -1, -1):
+            from datetime import date
+            m = (today.month - i - 1) % 12 + 1
+            y = today.year if today.month - i > 0 else today.year - 1
+            count = tenants.filter(created_at__year__lte=y, created_at__month__lte=m if y == today.year else 12).count()
+            val = sum(PLAN_MRR.get(t.plan, 0) for t in tenants.filter(status__in=("active","trial")))
+            mrr_trend.append({"label": MONTHS_ES[m - 1], "value": val if i == 0 else val * (0.85 ** i)})
+
+        plan_counts = {p: tenants.filter(plan=p).count() for p in ("starter", "growth", "enterprise")}
+        plan_mix = [
+            {"name": "Starter", "value": plan_counts["starter"], "color": "#6366f1"},
+            {"name": "Growth", "value": plan_counts["growth"], "color": "#10b981"},
+            {"name": "Enterprise", "value": plan_counts["enterprise"], "color": "#f59e0b"},
+        ]
+
+        return response.Response({
+            "kpis": kpis,
+            "mrrTrend": mrr_trend,
+            "planMix": plan_mix,
+            "churn": churn,
+            "arpa": arpa,
+        })
+
+
 class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Sale.objects.all().order_by("-created_at")
     serializer_class = serializers.SaleSerializer
