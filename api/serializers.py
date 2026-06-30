@@ -3,6 +3,26 @@ from rest_framework import serializers
 from . import models
 
 
+class NullablePKField(serializers.PrimaryKeyRelatedField):
+    """
+    PrimaryKeyRelatedField que acepta "" y strings no-enteras como null.
+    El frontend genera IDs cliente temporales (p.ej. "inv-abc123") mientras
+    espera la respuesta del backend; si llega un string no válido se trata
+    como null en lugar de lanzar un 400.
+    """
+    def to_internal_value(self, data):
+        if data in (None, "", "null", "undefined"):
+            if self.allow_null:
+                return None
+            self.fail("null")
+        try:
+            int(data)
+        except (ValueError, TypeError):
+            if self.allow_null:
+                return None
+        return super().to_internal_value(data)
+
+
 class CategorySerializer(serializers.ModelSerializer):
     count = serializers.IntegerField(source="products.count", read_only=True)
 
@@ -75,7 +95,7 @@ class CustomerSerializer(serializers.ModelSerializer):
 
 
 class RecipeIngredientSerializer(serializers.ModelSerializer):
-    inventoryId = serializers.PrimaryKeyRelatedField(
+    inventoryId = NullablePKField(
         source="item", queryset=models.InventoryItem.objects.all(), required=False, allow_null=True
     )
 
@@ -86,7 +106,7 @@ class RecipeIngredientSerializer(serializers.ModelSerializer):
 
 class RecipeSerializer(serializers.ModelSerializer):
     ingredients = RecipeIngredientSerializer(many=True)
-    productId = serializers.PrimaryKeyRelatedField(
+    productId = NullablePKField(
         source="product", queryset=models.Product.objects.all(), required=False, allow_null=True
     )
     prepMinutes = serializers.IntegerField(source="prep_minutes", default=10)
