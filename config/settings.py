@@ -2,6 +2,7 @@
 Configuración de Django para Axis POS.
 Multi-tenant SaaS · DRF · Channels (WebSockets) · Celery.
 """
+from datetime import timedelta
 from pathlib import Path
 import environ
 
@@ -98,6 +99,13 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticatedOrReadOnly",),
     "DEFAULT_PAGINATION_CLASS": None,
+}
+
+# Sin esto, SimpleJWT usa el default de 5 min para el access token, lo que
+# invalidaba cualquier guardado a los pocos minutos de haber iniciado sesión.
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=8),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
 }
 
 CORS_ALLOWED_ORIGINS = env.list(
