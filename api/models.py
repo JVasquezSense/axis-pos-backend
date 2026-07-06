@@ -100,7 +100,9 @@ class InventoryItem(TenantScoped):
     updated_at = models.DateTimeField(auto_now=True)
 
     def recompute_status(self):
-        if self.stock <= self.min_stock * 0.4:
+        stock = float(self.stock)
+        min_stock = float(self.min_stock)
+        if stock <= min_stock * 0.4:
             self.status = "critical"
         elif self.stock < self.min_stock:
             self.status = "low"

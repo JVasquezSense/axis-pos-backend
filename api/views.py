@@ -119,7 +119,7 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
     serializer_class = serializers.OrderSerializer
 
     def perform_create(self, serializer):
-        tenant_id = getattr(self.request.user, "tenant_id", None)
+        tenant_id = self._resolve_tenant_id()
         order = serializer.save(tenant_id=tenant_id) if tenant_id else serializer.save()
         # Empuja ticket a cocina vía WebSocket
         try:
@@ -142,13 +142,6 @@ class SupplierViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class PurchaseViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Purchase.objects.prefetch_related("lines__inventory_item").select_related("supplier")
     serializer_class = serializers.PurchaseSerializer
-
-    def perform_create(self, serializer):
-        tenant_id = getattr(self.request.user, "tenant_id", None)
-        if tenant_id:
-            serializer.save(tenant_id=tenant_id)
-        else:
-            serializer.save()
 
 
 # ─── Reservaciones ───────────────────────────────────────────────────────────
