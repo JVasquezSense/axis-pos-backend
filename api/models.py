@@ -205,6 +205,8 @@ class Purchase(TenantScoped):
     code = models.CharField(max_length=20)
     supplier = models.ForeignKey(Supplier, on_delete=models.PROTECT, related_name="purchases")
     date = models.DateField(auto_now_add=True)
+    subtotal = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    tax_total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     invoice_photo = models.TextField(blank=True)  # base64 data URL
 
@@ -216,7 +218,8 @@ class PurchaseLine(models.Model):
     purchase = models.ForeignKey(Purchase, on_delete=models.CASCADE, related_name="lines")
     inventory_item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT)
     quantity = models.DecimalField(max_digits=12, decimal_places=3)
-    unit_cost = models.DecimalField(max_digits=12, decimal_places=2)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2)  # costo antes de IVA
+    tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)  # % IVA/impuesto de esta línea
     unit = models.CharField(max_length=16, blank=True)
 
 

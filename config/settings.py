@@ -2,6 +2,7 @@
 Configuración de Django para Axis POS.
 Multi-tenant SaaS · DRF · Channels (WebSockets) · Celery.
 """
+from datetime import timedelta
 from pathlib import Path
 import environ
 
@@ -98,6 +99,13 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticatedOrReadOnly",),
     "DEFAULT_PAGINATION_CLASS": None,
+}
+
+# Tokens de larga duración (10 años ≈ sin vencimiento) para no perder sesión.
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(days=3650),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=3650),
+    "ROTATE_REFRESH_TOKENS": False,
 }
 
 CORS_ALLOWED_ORIGINS = env.list(

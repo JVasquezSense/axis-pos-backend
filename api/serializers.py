@@ -155,11 +155,12 @@ class PurchaseLineSerializer(serializers.ModelSerializer):
         source="inventory_item", queryset=models.InventoryItem.objects.all()
     )
     unitCost = serializers.DecimalField(source="unit_cost", max_digits=12, decimal_places=2)
+    taxRate = serializers.DecimalField(source="tax_rate", max_digits=5, decimal_places=2, required=False, default=0)
     name = serializers.CharField(source="inventory_item.name", read_only=True)
 
     class Meta:
         model = models.PurchaseLine
-        fields = ["id", "inventoryId", "name", "quantity", "unit", "unitCost"]
+        fields = ["id", "inventoryId", "name", "quantity", "unit", "unitCost", "taxRate"]
 
 
 class PurchaseSerializer(serializers.ModelSerializer):
@@ -169,10 +170,11 @@ class PurchaseSerializer(serializers.ModelSerializer):
     )
     supplierName = serializers.CharField(source="supplier.name", read_only=True)
     invoicePhoto = serializers.CharField(source="invoice_photo", required=False, allow_blank=True, default="")
+    taxTotal = serializers.DecimalField(source="tax_total", max_digits=14, decimal_places=2, required=False, default=0)
 
     class Meta:
         model = models.Purchase
-        fields = ["id", "code", "supplierId", "supplierName", "date", "total", "lines", "invoicePhoto"]
+        fields = ["id", "code", "supplierId", "supplierName", "date", "subtotal", "taxTotal", "total", "lines", "invoicePhoto"]
         read_only_fields = ["date", "supplierName"]
 
     def create(self, validated_data):
