@@ -7,6 +7,7 @@ Todo es multi-tenant: cada fila pertenece a un Tenant (restaurante).
 import uuid
 from django.conf import settings
 from django.db import models
+from django.utils.text import slugify
 
 
 def _default_features():
@@ -24,6 +25,7 @@ class Tenant(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=120)
+    slug = models.SlugField(max_length=140, unique=True, blank=True)
     logo = models.TextField(default="🍔")
     plan = models.CharField(max_length=20, choices=PLAN, default="starter")
     status = models.CharField(max_length=20, choices=STATUS, default="trial")
@@ -34,6 +36,17 @@ class Tenant(models.Model):
 
     def __str__(self):
         return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base = slugify(self.name)[:140] or "restaurante"
+            candidate = base
+            i = 2
+            while Tenant.objects.filter(slug=candidate).exclude(pk=self.pk).exists():
+                candidate = f"{base}-{i}"[:140]
+                i += 1
+            self.slug = candidate
+        super().save(*args, **kwargs)
 
 
 class UserProfile(models.Model):

@@ -25,7 +25,7 @@ class Command(BaseCommand):
 
         tenant, created = models.Tenant.objects.get_or_create(
             name="Demo Burger",
-            defaults={"logo": "🍔", "plan": "growth", "status": "active", "city": "Medellín"},
+            defaults={"slug": "demo-burger", "logo": "🍔", "plan": "growth", "status": "active", "city": "Medellín"},
         )
         if not created:
             self.stdout.write(self.style.WARNING("El restaurante demo ya existe."))

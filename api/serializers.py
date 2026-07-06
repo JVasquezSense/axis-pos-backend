@@ -262,7 +262,7 @@ class TenantAdminSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Tenant
         fields = [
-            "id", "name", "logo", "plan", "status", "city",
+            "id", "name", "slug", "logo", "plan", "status", "city",
             "locations", "features",
             "mrr", "users", "ordersMonth", "joinedAt",
         ]
