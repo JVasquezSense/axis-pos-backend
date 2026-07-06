@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('api', '0009_tenant_slug'),
+        ('api', '0010_tenant_slug_backfill'),
     ]
 
     operations = [
