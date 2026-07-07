@@ -59,22 +59,51 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
 
 
 class OrderLineSerializer(serializers.ModelSerializer):
+    productId = serializers.PrimaryKeyRelatedField(
+        source="product", queryset=models.Product.objects.all(), write_only=True
+    )
     product = ProductSerializer(read_only=True)
     unitPrice = serializers.DecimalField(source="unit_price", max_digits=12, decimal_places=2)
 
     class Meta:
         model = models.OrderLine
-        fields = ["id", "product", "quantity", "notes", "unitPrice"]
+        fields = ["id", "productId", "product", "quantity", "notes", "unitPrice"]
 
 
 class OrderSerializer(serializers.ModelSerializer):
-    lines = OrderLineSerializer(many=True, read_only=True)
-    tableNumber = serializers.IntegerField(source="table.number", read_only=True)
+    lines = OrderLineSerializer(many=True)
+    # Al escribir, el frontend solo conoce el NÚMERO de mesa (no el PK interno).
+    table = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    tableNumber = serializers.SerializerMethodField()
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)
 
     class Meta:
         model = models.Order
-        fields = ["id", "code", "tableNumber", "channel", "status", "lines", "customer", "phone", "receipt", "createdAt"]
+        fields = ["id", "code", "table", "tableNumber", "channel", "status", "lines", "customer", "phone", "receipt", "createdAt"]
+
+    def get_tableNumber(self, obj):
+        return obj.table.number if obj.table else None
+
+    def create(self, validated_data):
+        lines_data = validated_data.pop("lines", [])
+        table_number = validated_data.pop("table", None)
+        if table_number is not None:
+            validated_data["table"] = models.Table.objects.filter(
+                tenant_id=validated_data.get("tenant_id"), number=table_number
+            ).first()
+        order = models.Order.objects.create(**validated_data)
+        for line_data in lines_data:
+            models.OrderLine.objects.create(order=order, **line_data)
+        return order
+
+    def update(self, instance, validated_data):
+        # Los PATCH desde cocina/caja solo cambian estado; no se reescriben líneas ni mesa.
+        validated_data.pop("lines", None)
+        validated_data.pop("table", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
 
 
 class TableSerializer(serializers.ModelSerializer):

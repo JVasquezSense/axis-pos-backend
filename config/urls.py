@@ -13,6 +13,10 @@ class AxisTokenSerializer(TokenObtainPairSerializer):
             token["role"] = user.profile.role
         except Exception:
             token["role"] = "admin" if user.is_superuser else "cashier"
+        try:
+            token["tenant_id"] = str(user.profile.tenant_id)
+        except Exception:
+            token["tenant_id"] = None
         return token
 
 

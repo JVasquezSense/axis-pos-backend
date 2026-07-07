@@ -115,8 +115,19 @@ class CustomerViewSet(TenantQuerySet, viewsets.ModelViewSet):
 
 
 class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
-    queryset = models.Order.objects.prefetch_related("lines")
+    queryset = models.Order.objects.prefetch_related("lines").order_by("-created_at")
     serializer_class = serializers.OrderSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            statuses = [s.strip() for s in status_param.split(",") if s.strip()]
+            qs = qs.filter(status__in=statuses)
+        table_param = self.request.query_params.get("table")
+        if table_param:
+            qs = qs.filter(table__number=table_param)
+        return qs
 
     def perform_create(self, serializer):
         tenant_id = self._resolve_tenant_id()
@@ -127,6 +138,18 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
             async_to_sync(layer.group_send)(
                 f"kitchen_{order.tenant_id}",
                 {"type": "ticket.new", "ticket": serializers.OrderSerializer(order).data},
+            )
+        except Exception:
+            pass
+
+    def perform_update(self, serializer):
+        order = serializer.save()
+        # Avisa cambios de estado (ej. preparando/listo) a otras pantallas conectadas
+        try:
+            layer = get_channel_layer()
+            async_to_sync(layer.group_send)(
+                f"kitchen_{order.tenant_id}",
+                {"type": "ticket.update", "payload": serializers.OrderSerializer(order).data},
             )
         except Exception:
             pass
