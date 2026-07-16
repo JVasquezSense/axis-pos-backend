@@ -18,5 +18,9 @@ for model in (
     models.Reservation,
     models.Sale,
     models.Employee,
+    models.WhatsAppCustomer,
+    models.WhatsAppOrder,
+    models.WhatsAppOrderLine,
+    models.WhatsAppConfig,
 ):
     admin.site.register(model)

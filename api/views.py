@@ -352,6 +352,87 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
     http_method_names = ["get", "post", "head", "options"]  # read + create only
 
 
+# ─── WhatsApp ───────────────────────────────────────────────────────────────
+
+class WhatsAppCustomerViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    queryset = models.WhatsAppCustomer.objects.all().order_by("-last_order_at")
+    serializer_class = serializers.WhatsAppCustomerSerializer
+
+    @decorators.action(detail=False, methods=["post"], url_path="upsert")
+    def upsert(self, request):
+        """Create or update customer by phone number."""
+        tenant_id = self._resolve_tenant_id()
+        phone = request.data.get("phone", "").strip()
+        if not phone:
+            return response.Response({"error": "phone required"}, status=status.HTTP_400_BAD_REQUEST)
+        customer, created = models.WhatsAppCustomer.objects.get_or_create(
+            tenant_id=tenant_id, phone=phone,
+            defaults={"name": request.data.get("name", "Cliente")},
+        )
+        for field in ("name", "address", "latitude", "longitude"):
+            if field in request.data and request.data[field]:
+                setattr(customer, field, request.data[field])
+        if not created:
+            customer.save()
+        return response.Response(serializers.WhatsAppCustomerSerializer(customer).data)
+
+
+class WhatsAppOrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    queryset = models.WhatsAppOrder.objects.prefetch_related("lines").order_by("-created_at")
+    serializer_class = serializers.WhatsAppOrderSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status__in=[s.strip() for s in status_param.split(",")])
+        return qs
+
+    def perform_create(self, serializer):
+        tenant_id = self._resolve_tenant_id()
+        order = serializer.save(tenant_id=tenant_id)
+        # Link to WhatsAppCustomer and increment order count
+        try:
+            customer = models.WhatsAppCustomer.objects.get(tenant_id=tenant_id, phone=order.phone)
+            order.wa_customer = customer
+            order.save(update_fields=["wa_customer"])
+            customer.order_count = models.WhatsAppOrder.objects.filter(wa_customer=customer).count()
+            customer.last_order_at = order.created_at
+            customer.save(update_fields=["order_count", "last_order_at"])
+        except models.WhatsAppCustomer.DoesNotExist:
+            pass
+
+    @decorators.action(detail=True, methods=["patch"], url_path="receipt")
+    def update_receipt(self, request, pk=None):
+        order = self.get_object()
+        order.receipt_url = request.data.get("receiptUrl", "")
+        order.save(update_fields=["receipt_url"])
+        return response.Response(serializers.WhatsAppOrderSerializer(order).data)
+
+
+class WhatsAppConfigViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    queryset = models.WhatsAppConfig.objects.all()
+    serializer_class = serializers.WhatsAppConfigSerializer
+
+    def list(self, request, *args, **kwargs):
+        tenant_id = self._resolve_tenant_id()
+        config, _ = models.WhatsAppConfig.objects.get_or_create(
+            tenant_id=tenant_id,
+            defaults={"restaurant_name": "", "greeting": ""},
+        )
+        return response.Response(serializers.WhatsAppConfigSerializer(config).data)
+
+    def perform_create(self, serializer):
+        tenant_id = self._resolve_tenant_id()
+        existing = models.WhatsAppConfig.objects.filter(tenant_id=tenant_id).first()
+        if existing:
+            for attr, value in serializer.validated_data.items():
+                setattr(existing, attr, value)
+            existing.save()
+        else:
+            serializer.save(tenant_id=tenant_id)
+
+
 # ─── Analytics ───────────────────────────────────────────────────────────────
 
 def _tenant_qs(model_qs, user):

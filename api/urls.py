@@ -16,6 +16,9 @@ router.register("reservations", views.ReservationViewSet, basename="reservation"
 router.register("sales", views.SaleViewSet, basename="sale")
 router.register("employees", views.EmployeeViewSet, basename="employee")
 router.register("admin/tenants", views.AdminTenantViewSet, basename="admin-tenant")
+router.register("whatsapp/customers", views.WhatsAppCustomerViewSet, basename="wa-customer")
+router.register("whatsapp/orders", views.WhatsAppOrderViewSet, basename="wa-order")
+router.register("whatsapp/config", views.WhatsAppConfigViewSet, basename="wa-config")
 
 urlpatterns = router.urls + [
     path("dashboard/summary/", views.DashboardView.as_view(), name="dashboard-summary"),

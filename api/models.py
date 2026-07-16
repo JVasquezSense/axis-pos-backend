@@ -298,3 +298,71 @@ class Sale(TenantScoped):
 
     def __str__(self):
         return f"Venta {self.id} ${self.total}"
+
+
+# ─── WhatsApp ───────────────────────────────────────────────────────────────
+
+class WhatsAppCustomer(TenantScoped):
+    phone = models.CharField(max_length=30, db_index=True)
+    name = models.CharField(max_length=120, default="Cliente")
+    address = models.TextField(blank=True)
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+    order_count = models.PositiveIntegerField(default=0)
+    last_order_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("tenant", "phone")
+
+    def __str__(self):
+        return f"{self.name} ({self.phone})"
+
+
+class WhatsAppOrder(TenantScoped):
+    STATUS = [
+        ("review", "Por verificar"), ("verified", "Verificado"),
+        ("dispatched", "Despachado"), ("rejected", "Rechazado"),
+    ]
+    code = models.CharField(max_length=16)
+    wa_customer = models.ForeignKey(WhatsAppCustomer, on_delete=models.SET_NULL, null=True, blank=True, related_name="orders")
+    customer_name = models.CharField(max_length=120, blank=True)
+    phone = models.CharField(max_length=30)
+    address = models.TextField(blank=True)
+    total = models.DecimalField(max_digits=14, decimal_places=2)
+    status = models.CharField(max_length=12, choices=STATUS, default="review")
+    receipt_url = models.URLField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"WA {self.code} - {self.customer_name}"
+
+
+class WhatsAppOrderLine(models.Model):
+    order = models.ForeignKey(WhatsAppOrder, on_delete=models.CASCADE, related_name="lines")
+    name = models.CharField(max_length=200)
+    quantity = models.PositiveIntegerField(default=1)
+    price = models.DecimalField(max_digits=12, decimal_places=2)
+
+
+class WhatsAppConfig(TenantScoped):
+    twilio_sid = models.CharField(max_length=60, blank=True)
+    twilio_token = models.CharField(max_length=60, blank=True)
+    twilio_whatsapp_number = models.CharField(max_length=30, blank=True)
+    glm_api_key = models.CharField(max_length=120, blank=True)
+    glm_model = models.CharField(max_length=40, default="glm-4.5-flash")
+    glm_base_url = models.URLField(default="https://open.bigmodel.cn/api/paas/v4")
+    enabled = models.BooleanField(default=False)
+    greeting = models.TextField(blank=True)
+    restaurant_name = models.CharField(max_length=120, blank=True)
+    menu_text = models.TextField(blank=True)
+    payment_info = models.TextField(blank=True)
+    business_info = models.TextField(blank=True)
+    menu_pdf = models.FileField(upload_to="whatsapp/menus/", null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "WhatsApp configs"
+
+    def __str__(self):
+        return f"WA Config - {self.restaurant_name}"

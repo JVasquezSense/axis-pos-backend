@@ -324,3 +324,63 @@ class SaleSerializer(serializers.ModelSerializer):
         model = models.Sale
         fields = ["id", "total", "items", "method", "saleType", "table", "tip", "waiter", "ts"]
         read_only_fields = ["ts"]
+
+
+# ─── WhatsApp ───────────────────────────────────────────────────────────────
+
+class WhatsAppCustomerSerializer(serializers.ModelSerializer):
+    orderCount = serializers.IntegerField(source="order_count", read_only=True)
+    lastOrderAt = serializers.DateTimeField(source="last_order_at", read_only=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = models.WhatsAppCustomer
+        fields = ["id", "phone", "name", "address", "latitude", "longitude", "orderCount", "lastOrderAt", "createdAt"]
+
+
+class WhatsAppOrderLineSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.WhatsAppOrderLine
+        fields = ["id", "name", "quantity", "price"]
+
+
+class WhatsAppOrderSerializer(serializers.ModelSerializer):
+    lines = WhatsAppOrderLineSerializer(many=True)
+    customerName = serializers.CharField(source="customer_name")
+    receiptUrl = serializers.URLField(source="receipt_url", required=False, allow_blank=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = models.WhatsAppOrder
+        fields = ["id", "code", "customerName", "phone", "address", "total", "status", "receiptUrl", "lines", "createdAt"]
+
+    def create(self, validated_data):
+        lines_data = validated_data.pop("lines", [])
+        order = models.WhatsAppOrder.objects.create(**validated_data)
+        for line in lines_data:
+            models.WhatsAppOrderLine.objects.create(order=order, **line)
+        return order
+
+
+class WhatsAppConfigSerializer(serializers.ModelSerializer):
+    twilioSid = serializers.CharField(source="twilio_sid", allow_blank=True)
+    twilioToken = serializers.CharField(source="twilio_token", allow_blank=True)
+    twilioWhatsappNumber = serializers.CharField(source="twilio_whatsapp_number", allow_blank=True)
+    glmApiKey = serializers.CharField(source="glm_api_key", allow_blank=True)
+    glmModel = serializers.CharField(source="glm_model")
+    glmBaseUrl = serializers.URLField(source="glm_base_url")
+    restaurantName = serializers.CharField(source="restaurant_name", allow_blank=True)
+    menuText = serializers.CharField(source="menu_text", allow_blank=True)
+    paymentInfo = serializers.CharField(source="payment_info", allow_blank=True)
+    businessInfo = serializers.CharField(source="business_info", allow_blank=True)
+    menuPdf = serializers.FileField(source="menu_pdf", required=False, allow_null=True)
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+
+    class Meta:
+        model = models.WhatsAppConfig
+        fields = [
+            "id", "twilioSid", "twilioToken", "twilioWhatsappNumber",
+            "glmApiKey", "glmModel", "glmBaseUrl", "enabled", "greeting",
+            "restaurantName", "menuText", "paymentInfo", "businessInfo",
+            "menuPdf", "updatedAt",
+        ]
