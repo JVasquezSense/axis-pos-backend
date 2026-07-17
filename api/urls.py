@@ -21,6 +21,7 @@ router.register("whatsapp/orders", views.WhatsAppOrderViewSet, basename="wa-orde
 router.register("whatsapp/config", views.WhatsAppConfigViewSet, basename="wa-config")
 
 urlpatterns = router.urls + [
+    path("auth/me/", views.MeView.as_view(), name="auth-me"),
     path("dashboard/summary/", views.DashboardView.as_view(), name="dashboard-summary"),
     path("reports/executive/", views.ReportsView.as_view(), name="reports-executive"),
     path("admin/metrics/", views.AdminMetricsView.as_view(), name="admin-metrics"),

@@ -298,6 +298,30 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
         })
 
 
+class MeView(drf_views.APIView):
+    """GET /api/v1/auth/me/ — identidad y tenant del usuario autenticado.
+
+    Sirve para que el frontend sepa a qué restaurante pertenece el usuario y
+    para diagnosticar usuarios sin perfil/tenant (no aislados correctamente).
+    """
+    def get(self, request):
+        u = request.user
+        profile = getattr(u, "profile", None)
+        tenant = profile.tenant if profile else None
+        resolved = resolve_tenant_id(u)
+        return response.Response({
+            "id": u.id,
+            "username": u.get_username(),
+            "email": u.email,
+            "isSuperuser": u.is_superuser,
+            "hasProfile": profile is not None,
+            "role": getattr(profile, "role", None),
+            "tenantId": str(tenant.id) if tenant else None,
+            "tenantName": tenant.name if tenant else None,
+            "resolvedTenantId": str(resolved) if resolved else None,
+        })
+
+
 class AdminMetricsView(drf_views.APIView):
     """GET /api/v1/admin/metrics/ — métricas SaaS globales (solo superadmin)."""
     permission_classes = [permissions.IsAdminUser]
