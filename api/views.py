@@ -13,44 +13,54 @@ from datetime import timedelta
 from . import models, serializers
 
 
-class TenantQuerySet:
+def resolve_tenant_id(user):
     """
-    Mixin: limita el queryset al restaurante del usuario.
-    Si el usuario no tiene tenant_id asignado, usa el primer Tenant disponible
-    (setup single-tenant / superadmin sin perfil).
+    Resuelve el tenant del usuario autenticado desde su UserProfile.
+    Fail-closed: en un entorno multi-tenant devuelve None si no se puede
+    resolver (para no exponer datos de otro restaurante). En un despliegue
+    con un único Tenant asume ese tenant.
     """
-    def _resolve_tenant_id(self):
-        tenant_id = getattr(self.request.user, "tenant_id", None)
+    if user is not None and getattr(user, "is_authenticated", False):
+        tenant_id = getattr(user, "tenant_id", None)
         if not tenant_id:
             try:
-                tenant_id = self.request.user.profile.tenant_id
+                tenant_id = user.profile.tenant_id
             except Exception:
-                pass
-        if not tenant_id:
-            first = models.Tenant.objects.first()
-            tenant_id = first.pk if first else None
-        return tenant_id
+                tenant_id = None
+        if tenant_id:
+            return tenant_id
+    if models.Tenant.objects.count() == 1:
+        first = models.Tenant.objects.first()
+        return first.pk if first else None
+    return None
+
+
+class TenantQuerySet:
+    """
+    Mixin: limita el queryset al restaurante del usuario autenticado.
+
+    Aislamiento fail-closed: el tenant se resuelve EXCLUSIVAMENTE desde el
+    usuario autenticado (su UserProfile). Si no se puede resolver, el queryset
+    queda vacío en lugar de exponer datos de otro restaurante.
+
+    Excepción controlada: en un despliegue con un único Tenant se asume ese
+    tenant (setup single-tenant / webhooks internos), porque no hay datos de
+    terceros que filtrar. Con varios tenants NUNCA se adivina.
+    """
+    def _resolve_tenant_id(self):
+        return resolve_tenant_id(getattr(self.request, "user", None))
 
     def get_queryset(self):
         qs = super().get_queryset()
-        # Intenta tenant del perfil primero
-        tenant_id = getattr(self.request.user, "tenant_id", None)
-        if not tenant_id:
-            try:
-                tenant_id = self.request.user.profile.tenant_id
-            except Exception:
-                pass
-        if tenant_id:
-            return qs.filter(tenant_id=tenant_id)
-        first = models.Tenant.objects.first()
-        return qs.filter(tenant_id=first.pk) if first else qs
+        tenant_id = self._resolve_tenant_id()
+        return qs.filter(tenant_id=tenant_id) if tenant_id else qs.none()
 
     def perform_create(self, serializer):
         tenant_id = self._resolve_tenant_id()
-        if tenant_id:
-            serializer.save(tenant_id=tenant_id)
-        else:
-            serializer.save()
+        if not tenant_id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("No se pudo resolver el restaurante del usuario.")
+        serializer.save(tenant_id=tenant_id)
 
 
 class CategoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
@@ -69,9 +79,9 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
 
     @decorators.action(detail=False, methods=["get"])
     def movements(self, request):
-        tenant_id = getattr(request.user, "tenant_id", None)
+        tenant_id = resolve_tenant_id(request.user)
         qs = models.InventoryMovement.objects.filter(item__tenant_id=tenant_id) if tenant_id \
-            else models.InventoryMovement.objects.all()
+            else models.InventoryMovement.objects.none()
         return response.Response(serializers.InventoryMovementSerializer(qs, many=True).data)
 
     @decorators.action(detail=True, methods=["post"])
@@ -289,7 +299,8 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
 
 
 class AdminMetricsView(drf_views.APIView):
-    """GET /api/v1/admin/metrics/ — métricas SaaS globales."""
+    """GET /api/v1/admin/metrics/ — métricas SaaS globales (solo superadmin)."""
+    permission_classes = [permissions.IsAdminUser]
 
     def get(self, request):
         from django.db.models.functions import TruncMonth
@@ -436,8 +447,8 @@ class WhatsAppConfigViewSet(TenantQuerySet, viewsets.ModelViewSet):
 # ─── Analytics ───────────────────────────────────────────────────────────────
 
 def _tenant_qs(model_qs, user):
-    tenant_id = getattr(user, "tenant_id", None)
-    return model_qs.filter(tenant_id=tenant_id) if tenant_id else model_qs
+    tenant_id = resolve_tenant_id(user)
+    return model_qs.filter(tenant_id=tenant_id) if tenant_id else model_qs.none()
 
 
 def _delta(current, previous):
@@ -547,9 +558,9 @@ class DashboardView(drf_views.APIView):
         ]
 
         # Top products from OrderLines
-        tenant_id = getattr(request.user, "tenant_id", None)
+        tenant_id = resolve_tenant_id(request.user)
         raw_lines = models.OrderLine.objects.filter(order__tenant_id=tenant_id) if tenant_id \
-            else models.OrderLine.objects.all()
+            else models.OrderLine.objects.none()
         top_raw = (
             raw_lines
             .values("product__id", "product__name", "product__image", "product__category__name")
@@ -611,9 +622,9 @@ class ReportsView(drf_views.APIView):
         start_60 = today - timedelta(days=59)
 
         sale_qs = _tenant_qs(models.Sale.objects.all(), request.user)
-        tenant_id = getattr(request.user, "tenant_id", None)
+        tenant_id = resolve_tenant_id(request.user)
         line_qs = models.OrderLine.objects.filter(order__tenant_id=tenant_id) if tenant_id \
-            else models.OrderLine.objects.all()
+            else models.OrderLine.objects.none()
 
         curr = sale_qs.filter(created_at__date__gte=start_30)
         prev = sale_qs.filter(created_at__date__gte=start_60, created_at__date__lt=start_30)
