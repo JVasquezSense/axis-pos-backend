@@ -35,6 +35,79 @@ def resolve_tenant_id(user):
     return None
 
 
+def consume_order_inventory(order):
+    """
+    Descuenta del inventario los insumos consumidos por una orden, cruzando
+    cada OrderLine con la receta vinculada al producto (Recipe.product) y su
+    lista de ingredientes (RecipeIngredient). Genera InventoryMovement de tipo
+    "salida" y actualiza el stock + status de cada insumo afectado.
+
+    Es IDEMPOTENTE: solo descuenta si order.stock_consumed es False, y marca
+    el flag al terminar. Así, aunque la orden pase varias veces por
+    "preparing"/"ready", el stock se descuenta una única vez.
+
+    Regla de negocio (backlog #5): el inventario se descuenta cuando la cocina
+    prepara el pedido, NUNCA al cobrar.
+    """
+    if order.stock_consumed:
+        return
+    lines = list(order.lines.select_related("product").all())
+    if not lines:
+        order.stock_consumed = True
+        order.save(update_fields=["stock_consumed"])
+        return
+
+    # Receta por producto (un producto -> su ficha técnica). 1:1 esperado.
+    product_ids = [ln.product_id for ln in lines]
+    recipes = {
+        r.product_id: r
+        for r in models.Recipe.objects.filter(product_id__in=product_ids).prefetch_related("ingredients")
+        if r.product_id is not None
+    }
+
+    # Acumula consumo total por insumo (sumando todas las líneas de la orden).
+    consumption = {}  # {inventory_item_id: cantidad_total}
+    for ln in lines:
+        recipe = recipes.get(ln.product_id)
+        if not recipe:
+            continue
+        portions = max(recipe.portions, 1)
+        for ing in recipe.ingredients.all():
+            if ing.item_id is None:
+                continue
+            # Cantidad por porción ya considerando el desperdicio (waste 0..1).
+            effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
+            consumed = (effective / portions) * float(ln.quantity)
+            consumption[ing.item_id] = consumption.get(ing.item_id, 0) + consumed
+
+    if not consumption:
+        order.stock_consumed = True
+        order.save(update_fields=["stock_consumed"])
+        return
+
+    items = {it.id: it for it in models.InventoryItem.objects.filter(id__in=consumption.keys())}
+    for item_id, consumed in consumption.items():
+        item = items.get(item_id)
+        if not item:
+            continue
+        new_stock = max(float(item.stock) - consumed, 0)
+        item.stock = new_stock
+        item.recompute_status()
+        item.save(update_fields=["stock", "status", "updated_at"])
+        models.InventoryMovement.objects.create(
+            tenant=order.tenant,
+            item=item,
+            type="salida",
+            quantity=-consumed,
+            balance=item.stock,
+            unit_cost=item.cost,
+            reason=f"Venta · Orden {order.code}",
+        )
+
+    order.stock_consumed = True
+    order.save(update_fields=["stock_consumed"])
+
+
 class TenantQuerySet:
     """
     Mixin: limita el queryset al restaurante del usuario autenticado.
@@ -154,6 +227,14 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         order = serializer.save()
+        # Descuento de inventario al preparar/listo (backlog #5). Idempotente.
+        # El stock se descuenta cuando la cocina avanza el pedido, NUNCA al cobrar.
+        if order.status in ("preparing", "ready", "served", "paid") and not order.stock_consumed:
+            try:
+                with transaction.atomic():
+                    consume_order_inventory(order)
+            except Exception:
+                pass
         # Avisa cambios de estado (ej. preparando/listo) a otras pantallas conectadas
         try:
             layer = get_channel_layer()
@@ -385,6 +466,38 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Sale.objects.all().order_by("-created_at")
     serializer_class = serializers.SaleSerializer
     http_method_names = ["get", "post", "head", "options"]  # read + create only
+
+    def perform_create(self, serializer):
+        # Backlog #1: asigna número de factura correlativo por tenant.
+        tenant_id = self._resolve_tenant_id()
+        if not tenant_id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("No se pudo resolver el restaurante del usuario.")
+        tenant = models.Tenant.objects.select_for_update().get(pk=tenant_id)
+        tenant.invoice_seq = (tenant.invoice_seq or 0) + 1
+        seq = tenant.invoice_seq
+        prefix = tenant.invoice_prefix or "FV"
+        invoice_number = f"{prefix}-{seq:06d}"
+        tenant.save(update_fields=["invoice_seq"])
+        serializer.save(tenant_id=tenant_id, invoice_number=invoice_number)
+
+
+class CreditNoteViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    """Notas de crédito / devoluciones (backlog #6). Filtrado por tenant."""
+    queryset = models.CreditNote.objects.prefetch_related("lines").order_by("-created_at")
+    serializer_class = serializers.CreditNoteSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def perform_create(self, serializer):
+        tenant_id = self._resolve_tenant_id()
+        if not tenant_id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("No se pudo resolver el restaurante del usuario.")
+        user_label = ""
+        req_user = getattr(self.request, "user", None)
+        if getattr(req_user, "is_authenticated", False):
+            user_label = req_user.get_username() or getattr(req_user, "email", "") or ""
+        serializer.save(tenant_id=tenant_id, user=user_label)
 
 
 # ─── WhatsApp ───────────────────────────────────────────────────────────────
@@ -754,6 +867,18 @@ class ReportsView(drf_views.APIView):
         }
         hourly_heat = [{"label": f"{h:02d}:00", "value": hourly.get(h, 0.0)} for h in range(24)]
 
+        # Backlog #6: panel de devoluciones (notas de crédito) filtrado por tenant.
+        credit_qs = _tenant_qs(models.CreditNote.objects.all(), request.user)
+        credit_curr = credit_qs.filter(created_at__date__gte=start_30)
+        returns_count = credit_curr.count()
+        returns_total = float(credit_curr.aggregate(t=Sum("total"))["t"] or 0)
+        returns_by_reason = [
+            {"reason": r["reason"] or "—", "count": r["c"], "total": float(r["t"] or 0)}
+            for r in (
+                credit_curr.values("reason").annotate(c=Count("id"), t=Sum("total")).order_by("-c")[:8]
+            )
+        ]
+
         return response.Response({
             "kpis": kpis,
             "revenueTrend": revenue_trend,
@@ -764,4 +889,221 @@ class ReportsView(drf_views.APIView):
             "salesByLocation": sales_by_location,
             "topDishes": top_dishes,
             "hourlyHeat": hourly_heat,
+            "returns": {"count": returns_count, "total": returns_total, "byReason": returns_by_reason},
+        })
+
+
+class PublicMenuView(drf_views.APIView):
+    """
+    GET /api/v1/public/<slug>/menu/ — Carta pública de un restaurante por slug.
+    No requiere autenticación (cliente escanea QR en la mesa).
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, slug):
+        try:
+            tenant = models.Tenant.objects.get(slug=slug)
+        except models.Tenant.DoesNotExist:
+            return response.Response({"error": "Restaurante no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+        cats = models.Category.objects.filter(tenant=tenant)
+        products = models.Product.objects.filter(tenant=tenant, available=True).select_related("category")
+        tables = models.Table.objects.filter(tenant=tenant).values("id", "number")
+        return response.Response({
+            "restaurant": {
+                "id": str(tenant.id), "name": tenant.name, "logo": tenant.logo,
+                "city": tenant.city, "slug": tenant.slug,
+            },
+            "categories": serializers.CategorySerializer(cats, many=True).data,
+            "products": serializers.ProductSerializer(products, many=True).data,
+            "tables": [{"id": str(t["id"]), "number": t["number"]} for t in tables],
+        })
+
+
+class PublicOrderView(drf_views.APIView):
+    """
+    POST /api/v1/public/<slug>/order/ — Pedido web desde la carta (cliente).
+    No requiere autenticación. Asocia la mesa y emite el ticket al KDS vía WS.
+
+    Body: { table: <numero>, items: [{ productId, quantity, notes }], customer?, phone? }
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request, slug):
+        try:
+            tenant = models.Tenant.objects.get(slug=slug)
+        except models.Tenant.DoesNotExist:
+            return response.Response({"error": "Restaurante no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+
+        table_number = request.data.get("table")
+        items = request.data.get("items", [])
+        if not items or not isinstance(items, list):
+            return response.Response({"error": "items requerido"}, status=status.HTTP_400_BAD_REQUEST)
+
+        table = None
+        if table_number is not None:
+            table = models.Table.objects.filter(tenant=tenant, number=table_number).first()
+
+        code = f"WEB-{models.Order.objects.count() + 1:04d}"
+        order = models.Order.objects.create(
+            tenant=tenant, code=code, table=table, channel="web", status="pending",
+            customer=request.data.get("customer", "")[:120],
+            phone=request.data.get("phone", "")[:30],
+        )
+        for it in items:
+            try:
+                product = models.Product.objects.get(pk=it.get("productId"), tenant=tenant)
+            except (models.Product.DoesNotExist, (ValueError, TypeError)):
+                continue
+            models.OrderLine.objects.create(
+                order=order, product=product,
+                quantity=max(int(it.get("quantity", 1)), 1),
+                notes=(it.get("notes") or "")[:200],
+                unit_price=product.price,
+            )
+
+        # Tiempo promedio de espera basado en órdenes activas (backlog #8).
+        active = models.Order.objects.filter(tenant=tenant, status__in=["pending", "preparing"]).count()
+        avg_wait = active * 12  # estimación: 12 min por orden en cola
+
+        # Avisa al POS y al KDS en tiempo real.
+        try:
+            layer = get_channel_layer()
+            async_to_sync(layer.group_send)(
+                f"kitchen_{tenant.id}",
+                {"type": "ticket.new", "ticket": serializers.OrderSerializer(order).data},
+            )
+        except Exception:
+            pass
+
+        return response.Response({
+            "orderId": str(order.id), "code": order.code,
+            "table": table.number if table else None,
+            "status": order.status, "estimatedWait": avg_wait,
+        }, status=status.HTTP_201_CREATED)
+
+
+class PublicOrderStatusView(drf_views.APIView):
+    """
+    GET /api/v1/public/order/<uuid>/ — Estado de un pedido web para que el
+    cliente lo vea en vivo (backlog #8).
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, order_id):
+        try:
+            order = models.Order.objects.get(pk=order_id)
+        except (models.Order.DoesNotExist, ValueError):
+            return response.Response({"error": "Pedido no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+        active = models.Order.objects.filter(tenant=order.tenant, status__in=["pending", "preparing"]).count()
+        return response.Response({
+            "id": str(order.id), "code": order.code, "status": order.status,
+            "table": order.table.number if order.table else None,
+            "estimatedWait": active * 12,
+            "items": [
+                {"name": l.product.name, "quantity": l.quantity}
+                for l in order.lines.select_related("product").all()
+            ],
+            "createdAt": order.created_at.isoformat(),
+        })
+
+
+class DishConsumptionView(drf_views.APIView):
+    """
+    GET /api/v1/reports/dish-consumption/ — Salida por Plato (backlog #2).
+
+    Cruza los platos vendidos (OrderLine) con la ficha técnica (Recipe →
+    RecipeIngredient) para totalizar, por insumo, cuánto se consumió en el
+    período. Filtra ESTRICTAMENTE por el tenant del usuario autenticado.
+
+    Query params opcionales:
+      ?days=N   ventana en días hacia atrás (default 30)
+      ?from=YYYY-MM-DD&to=YYYY-MM-DD   rango explícito
+
+    Respuesta:
+      { "period": {...}, "dishes": [...], "supplies": [...] }
+    """
+
+    def get(self, request):
+        tenant_id = resolve_tenant_id(request.user)
+        if not tenant_id:
+            return response.Response({"period": {}, "dishes": [], "supplies": []})
+
+        today = timezone.localdate()
+        from_param = request.query_params.get("from")
+        to_param = request.query_params.get("to")
+        days = request.query_params.get("days")
+
+        if from_param and to_param:
+            try:
+                start = __import__("datetime").date.fromisoformat(from_param)
+                end = __import__("datetime").date.fromisoformat(to_param)
+            except ValueError:
+                start, end = today - timedelta(days=29), today
+        else:
+            window = 30
+            try:
+                window = max(int(days), 1) if days else 30
+            except ValueError:
+                pass
+            end = today
+            start = end - timedelta(days=window - 1)
+
+        # Líneas de órdenes del tenant en el período (solo de órdenes ya enviadas
+        # a cocina / en preparación, no las canceladas).
+        lines = (
+            models.OrderLine.objects
+            .filter(order__tenant_id=tenant_id)
+            .filter(order__created_at__date__gte=start, order__created_at__date__lte=end)
+            .exclude(order__status="paid")  # pagadas se cuentan igual; quitamos cancelled si existiera
+            .select_related("product")
+        )
+
+        # Recetas del tenant indexadas por producto: {product_id: (portions, [ingredients])}
+        product_ids = {ln.product_id for ln in lines}
+        recipe_map = {}
+        for r in models.Recipe.objects.filter(product_id__in=product_ids, tenant_id=tenant_id).prefetch_related("ingredients__item"):
+            if r.product_id is not None and r.product_id not in recipe_map:
+                recipe_map[r.product_id] = (max(r.portions, 1), list(r.ingredients.all()))
+
+        # Acumuladores
+        dish_agg = {}     # {product_id: {name, units, revenue}}
+        supply_agg = {}   # {item_id: {name, unit, consumed, cost}}
+
+        for ln in lines:
+            pid = ln.product_id
+            pname = ln.product.name
+            d = dish_agg.setdefault(pid, {"id": str(pid), "name": pname, "units": 0, "revenue": 0.0})
+            d["units"] += ln.quantity
+            d["revenue"] += float(ln.quantity) * float(ln.unit_price)
+
+            ings_portions = recipe_map.get(pid)
+            if not ings_portions:
+                continue
+            portions, ings = ings_portions
+            for ing in ings:
+                if ing.item_id is None:
+                    continue
+                effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
+                consumed = (effective / portions) * float(ln.quantity)
+                s = supply_agg.setdefault(ing.item_id, {
+                    "id": str(ing.item_id),
+                    "name": ing.item.name if ing.item else (ing.name or "—"),
+                    "unit": ing.item.unit if ing.item else (ing.unit or ""),
+                    "consumed": 0.0,
+                    "cost": 0.0,
+                })
+                s["consumed"] += consumed
+                if ing.item:
+                    s["cost"] += consumed * float(ing.item.cost)
+
+        dishes = sorted(dish_agg.values(), key=lambda x: x["units"], reverse=True)
+        supplies = sorted(supply_agg.values(), key=lambda x: x["consumed"], reverse=True)
+
+        return response.Response({
+            "period": {"from": start.isoformat(), "to": end.isoformat()},
+            "dishes": dishes,
+            "supplies": [
+                {**s, "consumed": round(s["consumed"], 3), "cost": round(s["cost"], 0)}
+                for s in supplies
+            ],
         })

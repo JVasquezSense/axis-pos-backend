@@ -14,6 +14,7 @@ router.register("suppliers", views.SupplierViewSet, basename="supplier")
 router.register("purchases", views.PurchaseViewSet, basename="purchase")
 router.register("reservations", views.ReservationViewSet, basename="reservation")
 router.register("sales", views.SaleViewSet, basename="sale")
+router.register("returns", views.CreditNoteViewSet, basename="credit-note")
 router.register("employees", views.EmployeeViewSet, basename="employee")
 router.register("admin/tenants", views.AdminTenantViewSet, basename="admin-tenant")
 router.register("whatsapp/customers", views.WhatsAppCustomerViewSet, basename="wa-customer")
@@ -24,5 +25,10 @@ urlpatterns = router.urls + [
     path("auth/me/", views.MeView.as_view(), name="auth-me"),
     path("dashboard/summary/", views.DashboardView.as_view(), name="dashboard-summary"),
     path("reports/executive/", views.ReportsView.as_view(), name="reports-executive"),
+    path("reports/dish-consumption/", views.DishConsumptionView.as_view(), name="reports-dish-consumption"),
     path("admin/metrics/", views.AdminMetricsView.as_view(), name="admin-metrics"),
+    # Endpoints públicos para pedidos web + QR por mesa (backlog #8).
+    path("public/<slug>/menu/", views.PublicMenuView.as_view(), name="public-menu"),
+    path("public/<slug>/order/", views.PublicOrderView.as_view(), name="public-order"),
+    path("public/order/<uuid:order_id>/", views.PublicOrderStatusView.as_view(), name="public-order-status"),
 ]

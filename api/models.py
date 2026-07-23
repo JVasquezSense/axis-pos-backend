@@ -33,6 +33,14 @@ class Tenant(models.Model):
     locations = models.PositiveIntegerField(default=1)
     features = models.JSONField(default=_default_features)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Información fiscal para la factura/ticket (backlog #1).
+    tax_id = models.CharField(max_length=40, blank=True)        # NIT / RUT
+    legal_name = models.CharField(max_length=160, blank=True)   # Razón social
+    address = models.CharField(max_length=200, blank=True)
+    phone = models.CharField(max_length=40, blank=True)
+    resolution = models.CharField(max_length=200, blank=True)   # Resolución DIAN
+    invoice_prefix = models.CharField(max_length=12, default="FV")
+    invoice_seq = models.PositiveIntegerField(default=0)        # correlativo de factura
 
     def __str__(self):
         return self.name
@@ -85,6 +93,9 @@ class Product(TenantScoped):
     available = models.BooleanField(default=True)
     prep_minutes = models.PositiveIntegerField(default=10)
     popular = models.BooleanField(default=False)
+    # Backlog #6: si el producto se devuelve, ¿reintegra stock? (bebida sellada sí,
+    # comida preparada no). Por defecto reintegra (productos sellados).
+    restockable = models.BooleanField(default=True)
 
 
 class InventoryItem(TenantScoped):
@@ -179,6 +190,9 @@ class Order(TenantScoped):
     phone = models.CharField(max_length=30, blank=True)
     receipt = models.FileField(upload_to="receipts/", null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Idempotencia del descuento de inventario: el stock se descuenta una sola
+    # vez, cuando la cocina pasa la orden a "preparing"/"ready". Nunca al cobrar.
+    stock_consumed = models.BooleanField(default=False)
 
 
 class OrderLine(models.Model):
@@ -187,6 +201,17 @@ class OrderLine(models.Model):
     quantity = models.PositiveIntegerField(default=1)
     notes = models.CharField(max_length=200, blank=True)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+
+
+class OrderChangeLog(TenantScoped):
+    """Auditoría de ediciones a una orden ya enviada (backlog #4)."""
+    ACTION = [("edit", "Edición"), ("add", "Agregar"), ("remove", "Eliminar"), ("status", "Cambio de estado")]
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="change_logs")
+    action = models.CharField(max_length=12, choices=ACTION, default="edit")
+    user = models.CharField(max_length=80, blank=True)
+    summary = models.CharField(max_length=200, blank=True)
+    detail = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class Customer(TenantScoped):
@@ -288,16 +313,48 @@ class Sale(TenantScoped):
         ("transfer", "Transferencia"), ("nequi", "Nequi"),
     ]
     total = models.DecimalField(max_digits=14, decimal_places=2)
+    subtotal = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    tax = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    discount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     items = models.PositiveIntegerField(default=0)
     method = models.CharField(max_length=20, choices=METHODS, default="cash")
     sale_type = models.CharField(max_length=80, blank=True)
     table_number = models.PositiveIntegerField(null=True, blank=True)
     tip = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     waiter = models.CharField(max_length=80, blank=True)
+    customer = models.CharField(max_length=120, blank=True)
+    observations = models.CharField(max_length=300, blank=True)
+    # Número de factura correlativo por tenant (backlog #1).
+    invoice_number = models.CharField(max_length=24, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"Venta {self.id} ${self.total}"
+
+
+# ─── Devoluciones (Notas de Crédito) ──────────────────────────────────────────
+
+class CreditNote(TenantScoped):
+    """Nota de crédito por devolución de una venta o producto (backlog #6)."""
+    code = models.CharField(max_length=24)
+    sale = models.ForeignKey(Sale, on_delete=models.SET_NULL, null=True, blank=True, related_name="credit_notes")
+    total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    method = models.CharField(max_length=20, default="cash")
+    reason = models.CharField(max_length=300)  # motivo obligatorio
+    user = models.CharField(max_length=80, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"NC {self.code}"
+
+
+class CreditNoteLine(models.Model):
+    note = models.ForeignKey(CreditNote, on_delete=models.CASCADE, related_name="lines")
+    product = models.ForeignKey(Product, on_delete=models.PROTECT)
+    name = models.CharField(max_length=120)
+    quantity = models.PositiveIntegerField(default=1)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    restocked = models.BooleanField(default=False)
 
 
 # ─── WhatsApp ───────────────────────────────────────────────────────────────

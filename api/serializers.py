@@ -36,7 +36,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.Product
-        fields = ["id", "name", "description", "price", "category", "image", "tags", "available", "prepMinutes", "popular"]
+        fields = ["id", "name", "description", "price", "category", "image", "tags", "available", "prepMinutes", "popular", "restockable"]
 
 
 class InventoryItemSerializer(serializers.ModelSerializer):
@@ -46,6 +46,28 @@ class InventoryItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.InventoryItem
         fields = ["id", "name", "category", "stock", "unit", "minStock", "cost", "supplier", "status", "updatedAt"]
+
+    def create(self, validated_data):
+        """
+        Al crear un insumo se registra su movimiento "inicial" en el kardex,
+        con balance = stock inicial. Así el saldo inicial del kardex nunca
+        aparece en 0 y los movimientos posteriores encadenan correctamente.
+        El tenant lo inyecta InventoryViewSet.perform_create (TenantQuerySet).
+        """
+        stock = validated_data.get("stock", 0)
+        item = models.InventoryItem.objects.create(**validated_data)
+        item.recompute_status()
+        item.save(update_fields=["status"])
+        models.InventoryMovement.objects.create(
+            tenant=item.tenant,
+            item=item,
+            type="inicial",
+            quantity=stock,
+            balance=stock,
+            unit_cost=item.cost,
+            reason=f"Saldo inicial · {item.name}",
+        )
+        return item
 
 
 class InventoryMovementSerializer(serializers.ModelSerializer):
@@ -97,12 +119,55 @@ class OrderSerializer(serializers.ModelSerializer):
         return order
 
     def update(self, instance, validated_data):
-        # Los PATCH desde cocina/caja solo cambian estado; no se reescriben líneas ni mesa.
-        validated_data.pop("lines", None)
-        validated_data.pop("table", None)
+        # PATCH desde cocina/caja: cambia estado y, si vienen "lines", reemplaza
+        # las líneas de la orden (ediciones del KDS: agregar/quitar/modificar).
+        lines_data = validated_data.pop("lines", None)
+        table_number = validated_data.pop("table", None)
+        prev_status = instance.status
+        if table_number is not None:
+            instance.table = models.Table.objects.filter(
+                tenant_id=instance.tenant_id, number=table_number
+            ).first()
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
+
+        request = self.context.get("request")
+        user_label = ""
+        if request is not None and getattr(request, "user", None).is_authenticated:
+            user_label = request.user.get_username() or getattr(request.user, "email", "") or ""
+
+        if lines_data is not None:
+            # Snapshot previo para el log de auditoría (backlog #4).
+            before = [
+                {"product": ln.product.name, "quantity": ln.quantity, "unit_price": str(ln.unit_price), "notes": ln.notes}
+                for ln in instance.lines.all()
+            ]
+            instance.lines.all().delete()
+            for line_data in lines_data:
+                models.OrderLine.objects.create(order=instance, **line_data)
+            after = [
+                {"product": ln.product.name, "quantity": ln.quantity, "unit_price": str(ln.unit_price), "notes": ln.notes}
+                for ln in instance.lines.all()
+            ]
+            models.OrderChangeLog.objects.create(
+                tenant=instance.tenant,
+                order=instance,
+                action="edit",
+                user=user_label,
+                summary="Líneas modificadas",
+                detail={"before": before, "after": after},
+            )
+
+        if "status" in validated_data and validated_data["status"] != prev_status:
+            models.OrderChangeLog.objects.create(
+                tenant=instance.tenant,
+                order=instance,
+                action="status",
+                user=user_label,
+                summary=f"{prev_status} → {instance.status}",
+                detail={"from": prev_status, "to": instance.status},
+            )
         return instance
 
 
@@ -322,8 +387,11 @@ class SaleSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.Sale
-        fields = ["id", "total", "items", "method", "saleType", "table", "tip", "waiter", "ts"]
-        read_only_fields = ["ts"]
+        fields = ["id", "total", "subtotal", "tax", "discount", "items", "method", "saleType",
+                  "table", "tip", "waiter", "customer", "observations", "invoiceNumber", "ts"]
+        read_only_fields = ["ts", "invoiceNumber"]
+
+    invoiceNumber = serializers.CharField(source="invoice_number", read_only=True)
 
 
 # ─── WhatsApp ───────────────────────────────────────────────────────────────
@@ -384,3 +452,91 @@ class WhatsAppConfigSerializer(serializers.ModelSerializer):
             "restaurantName", "menuText", "paymentInfo", "businessInfo",
             "menuPdf", "updatedAt",
         ]
+
+
+# ─── Devoluciones (Notas de Crédito) ──────────────────────────────────────────
+
+class CreditNoteLineSerializer(serializers.ModelSerializer):
+    productId = serializers.PrimaryKeyRelatedField(
+        source="product", queryset=models.Product.objects.all(), write_only=True
+    )
+    productName = serializers.CharField(source="name", read_only=True)
+    unitPrice = serializers.DecimalField(source="unit_price", max_digits=12, decimal_places=2)
+
+    class Meta:
+        model = models.CreditNoteLine
+        fields = ["id", "productId", "productName", "quantity", "unitPrice", "restocked"]
+
+
+class CreditNoteSerializer(serializers.ModelSerializer):
+    lines = CreditNoteLineSerializer(many=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = models.CreditNote
+        fields = ["id", "code", "sale", "total", "method", "reason", "user", "lines", "createdAt"]
+        read_only_fields = ["code", "user"]
+
+    def validate_reason(self, value):
+        # Backlog #6: motivo de devolución obligatorio.
+        if not value or not value.strip():
+            raise serializers.ValidationError("El motivo de la devolución es obligatorio.")
+        return value.strip()
+
+    def create(self, validated_data):
+        lines_data = validated_data.pop("lines", [])
+        tenant_id = validated_data.get("tenant_id")
+        tenant = models.Tenant.objects.get(pk=tenant_id) if tenant_id else None
+        # Correlativo de nota de crédito por tenant.
+        seq = (models.CreditNote.objects.filter(tenant=tenant).count() + 1)
+        validated_data["code"] = f"NC-{seq:06d}"
+        note = models.CreditNote.objects.create(**validated_data)
+
+        # Reintegra inventario solo de productos marcados como restockable.
+        for line_data in lines_data:
+            product = line_data["product"]
+            restocked = False
+            if getattr(product, "restockable", True):
+                restocked = _restock_product(product, line_data["quantity"], note, tenant)
+            models.CreditNoteLine.objects.create(
+                note=note,
+                product=product,
+                name=product.name,
+                quantity=line_data["quantity"],
+                unit_price=line_data["unit_price"],
+                restocked=restocked,
+            )
+        return note
+
+
+def _restock_product(product, quantity, note, tenant):
+    """
+    Reintegra al inventario los insumos de la receta del producto devuelto.
+    Genera un InventoryMovement de tipo "entrada" por cada insumo afectado.
+    Retorna True si reintegró algo.
+    """
+    recipe = models.Recipe.objects.filter(product=product, tenant=tenant).prefetch_related("ingredients").first()
+    if not recipe:
+        return False
+    portions = max(recipe.portions, 1)
+    reintegrated = False
+    for ing in recipe.ingredients.all():
+        if ing.item_id is None:
+            continue
+        item = ing.item
+        effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
+        qty_back = (effective / portions) * float(quantity)
+        item.stock = float(item.stock) + qty_back
+        item.recompute_status()
+        item.save(update_fields=["stock", "status", "updated_at"])
+        models.InventoryMovement.objects.create(
+            tenant=tenant,
+            item=item,
+            type="entrada",
+            quantity=qty_back,
+            balance=item.stock,
+            unit_cost=item.cost,
+            reason=f"Devolución · {note.code}",
+        )
+        reintegrated = True
+    return reintegrated
