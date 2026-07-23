@@ -473,12 +473,13 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
         if not tenant_id:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("No se pudo resolver el restaurante del usuario.")
-        tenant = models.Tenant.objects.select_for_update().get(pk=tenant_id)
-        tenant.invoice_seq = (tenant.invoice_seq or 0) + 1
-        seq = tenant.invoice_seq
-        prefix = tenant.invoice_prefix or "FV"
-        invoice_number = f"{prefix}-{seq:06d}"
-        tenant.save(update_fields=["invoice_seq"])
+        with transaction.atomic():
+            tenant = models.Tenant.objects.select_for_update().get(pk=tenant_id)
+            tenant.invoice_seq = (tenant.invoice_seq or 0) + 1
+            seq = tenant.invoice_seq
+            prefix = tenant.invoice_prefix or "FV"
+            invoice_number = f"{prefix}-{seq:06d}"
+            tenant.save(update_fields=["invoice_seq"])
         serializer.save(tenant_id=tenant_id, invoice_number=invoice_number)
 
 
@@ -672,13 +673,11 @@ class DashboardView(drf_views.APIView):
         # Sales vs last year (monthly)
         current_year = today.year
         monthly_curr = {
-            r["m"]: float(r["total"])
+            r["created_at__month"]: float(r["total"])
             for r in (
                 sale_qs.filter(created_at__year=current_year)
-                .annotate(m=TruncDate("created_at"))
                 .values("created_at__month")
                 .annotate(total=Sum("total"))
-                .values("created_at__month", "total")
             )
         }
         monthly_prev = {
