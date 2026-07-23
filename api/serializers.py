@@ -274,6 +274,7 @@ class PurchaseSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         lines_data = validated_data.pop("lines", [])
         purchase = models.Purchase.objects.create(**validated_data)
+        affected_item_ids = []
         for line_data in lines_data:
             inv_item = line_data.pop("inventory_item")
             pl = models.PurchaseLine.objects.create(
@@ -283,6 +284,7 @@ class PurchaseSerializer(serializers.ModelSerializer):
             inv_item.stock = float(inv_item.stock) + float(pl.quantity)
             inv_item.recompute_status()
             inv_item.save()
+            affected_item_ids.append(inv_item.id)
             models.InventoryMovement.objects.create(
                 tenant=purchase.tenant,
                 item=inv_item,
@@ -292,6 +294,9 @@ class PurchaseSerializer(serializers.ModelSerializer):
                 unit_cost=pl.unit_cost,
                 reason=f"Compra {purchase.code} · {purchase.supplier.name}",
             )
+        # Una compra sube stock: puede reactivar productos que estaban "Agotado".
+        from .views import sync_products_availability
+        sync_products_availability(affected_item_ids)
         return purchase
 
 
@@ -520,6 +525,7 @@ def _restock_product(product, quantity, note, tenant):
         return False
     portions = max(recipe.portions, 1)
     reintegrated = False
+    affected_item_ids = []
     for ing in recipe.ingredients.all():
         if ing.item_id is None:
             continue
@@ -529,6 +535,7 @@ def _restock_product(product, quantity, note, tenant):
         item.stock = float(item.stock) + qty_back
         item.recompute_status()
         item.save(update_fields=["stock", "status", "updated_at"])
+        affected_item_ids.append(item.id)
         models.InventoryMovement.objects.create(
             tenant=tenant,
             item=item,
@@ -539,4 +546,8 @@ def _restock_product(product, quantity, note, tenant):
             reason=f"Devolución · {note.code}",
         )
         reintegrated = True
+    # El reintegro sube stock: puede reactivar productos "Agotado".
+    if affected_item_ids:
+        from .views import sync_products_availability
+        sync_products_availability(affected_item_ids)
     return reintegrated

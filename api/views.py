@@ -107,6 +107,51 @@ def consume_order_inventory(order):
     order.stock_consumed = True
     order.save(update_fields=["stock_consumed"])
 
+    # Marca "Agotado" los productos que ya no alcanzan a prepararse.
+    sync_products_availability(list(consumption.keys()))
+
+
+def sync_products_availability(item_ids):
+    """
+    Sincroniza la disponibilidad ("Agotado") de los productos cuya receta usa
+    alguno de los insumos indicados, según el stock actual:
+
+      - Si con el stock actual no se puede preparar ni UNA porción → available=False.
+      - Si vuelve a alcanzar (p. ej. tras una compra/reintegro) → available=True.
+
+    Solo afecta productos con receta e insumos vinculados; los productos sin
+    receta conservan su disponibilidad manual. Usa la misma fórmula de consumo
+    que consume_order_inventory (cantidad × (1+merma) / porciones).
+    """
+    item_ids = [i for i in item_ids if i]
+    if not item_ids:
+        return
+    recipes = (
+        models.Recipe.objects
+        .filter(product__isnull=False, ingredients__item_id__in=item_ids)
+        .distinct()
+        .select_related("product")
+        .prefetch_related("ingredients__item")
+    )
+    for recipe in recipes:
+        product = recipe.product
+        portions = max(recipe.portions, 1)
+        max_portions = None
+        for ing in recipe.ingredients.all():
+            if ing.item_id is None or ing.item is None:
+                continue
+            per_portion = (float(ing.quantity) * (1.0 + float(ing.waste or 0))) / portions
+            if per_portion <= 0:
+                continue
+            feasible = int(float(ing.item.stock) // per_portion)
+            max_portions = feasible if max_portions is None else min(max_portions, feasible)
+        if max_portions is None:
+            continue  # receta sin insumos medibles: no tocar disponibilidad
+        available = max_portions >= 1
+        if product.available != available:
+            product.available = available
+            product.save(update_fields=["available"])
+
 
 class TenantQuerySet:
     """
@@ -179,6 +224,8 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
             unit_cost=item.cost,
             reason=reason,
         )
+        # Un ajuste de stock puede agotar o reactivar los productos que lo usan.
+        sync_products_availability([item.id])
         return response.Response(serializers.InventoryItemSerializer(item).data)
 
 
