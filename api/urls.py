@@ -30,5 +30,5 @@ urlpatterns = router.urls + [
     # Endpoints públicos para pedidos web + QR por mesa (backlog #8).
     path("public/<slug>/menu/", views.PublicMenuView.as_view(), name="public-menu"),
     path("public/<slug>/order/", views.PublicOrderView.as_view(), name="public-order"),
-    path("public/order/<uuid:order_id>/", views.PublicOrderStatusView.as_view(), name="public-order-status"),
+    path("public/order/<str:order_id>/", views.PublicOrderStatusView.as_view(), name="public-order-status"),
 ]
