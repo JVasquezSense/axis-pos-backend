@@ -951,7 +951,7 @@ class PublicOrderView(drf_views.APIView):
         for it in items:
             try:
                 product = models.Product.objects.get(pk=it.get("productId"), tenant=tenant)
-            except (models.Product.DoesNotExist, (ValueError, TypeError)):
+            except (models.Product.DoesNotExist, ValueError, TypeError):
                 continue
             models.OrderLine.objects.create(
                 order=order, product=product,
