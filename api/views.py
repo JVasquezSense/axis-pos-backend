@@ -133,6 +133,8 @@ def sync_products_availability(item_ids):
         .select_related("product")
         .prefetch_related("ingredients__item")
     )
+    changed = []       # [{"id": str, "available": bool}] para el push en vivo
+    tenant_id = None
     for recipe in recipes:
         product = recipe.product
         portions = max(recipe.portions, 1)
@@ -151,6 +153,19 @@ def sync_products_availability(item_ids):
         if product.available != available:
             product.available = available
             product.save(update_fields=["available"])
+            changed.append({"id": str(product.id), "available": available})
+            tenant_id = product.tenant_id
+
+    # Notifica en vivo a las pantallas (menú/pedidos) del restaurante.
+    if changed and tenant_id is not None:
+        try:
+            layer = get_channel_layer()
+            async_to_sync(layer.group_send)(
+                f"kitchen_{tenant_id}",
+                {"type": "product.availability", "products": changed},
+            )
+        except Exception:
+            pass
 
 
 class TenantQuerySet:
