@@ -227,9 +227,11 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         order = serializer.save()
-        # Descuento de inventario al preparar/listo (backlog #5). Idempotente.
-        # El stock se descuenta cuando la cocina avanza el pedido, NUNCA al cobrar.
-        if order.status in ("preparing", "ready", "served", "paid") and not order.stock_consumed:
+        # Descuento de inventario cuando la cocina marca el pedido como COMPLETADO
+        # (ready), no al iniciar preparación ni al cobrar. Idempotente.
+        # "served"/"paid" quedan como red de seguridad para pedidos que se cobran
+        # sin pasar por el KDS (p.ej. takeaway prepago); consume una sola vez.
+        if order.status in ("ready", "served", "paid") and not order.stock_consumed:
             try:
                 with transaction.atomic():
                     consume_order_inventory(order)
