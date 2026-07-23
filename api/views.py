@@ -1047,13 +1047,14 @@ class DishConsumptionView(drf_views.APIView):
             end = today
             start = end - timedelta(days=window - 1)
 
-        # Líneas de órdenes del tenant en el período (solo de órdenes ya enviadas
-        # a cocina / en preparación, no las canceladas).
+        # Líneas de órdenes del tenant en el período. Cuenta todo lo que ya
+        # salió de cocina o se vendió (preparing/ready/served/paid); excluye solo
+        # lo que aún no se ha preparado (pending), que todavía no consumió insumos.
         lines = (
             models.OrderLine.objects
             .filter(order__tenant_id=tenant_id)
             .filter(order__created_at__date__gte=start, order__created_at__date__lte=end)
-            .exclude(order__status="paid")  # pagadas se cuentan igual; quitamos cancelled si existiera
+            .exclude(order__status="pending")
             .select_related("product")
         )
 
@@ -1064,14 +1065,22 @@ class DishConsumptionView(drf_views.APIView):
             if r.product_id is not None and r.product_id not in recipe_map:
                 recipe_map[r.product_id] = (max(r.portions, 1), list(r.ingredients.all()))
 
-        # Acumuladores
-        dish_agg = {}     # {product_id: {name, units, revenue}}
-        supply_agg = {}   # {item_id: {name, unit, consumed, cost}}
+        # Acumuladores. Cada plato lleva su propio desglose de insumos (_supplies)
+        # para que el frontend muestre el consumo POR PLATO sin recalcular nada.
+        dish_agg = {}     # {product_id: {id, name, emoji, units, revenue, cost, _supplies}}
+        supply_agg = {}   # agregado global {item_id: {id, name, unit, consumed, cost}}
 
         for ln in lines:
             pid = ln.product_id
-            pname = ln.product.name
-            d = dish_agg.setdefault(pid, {"id": str(pid), "name": pname, "units": 0, "revenue": 0.0})
+            d = dish_agg.setdefault(pid, {
+                "id": str(pid),
+                "name": ln.product.name,
+                "emoji": ln.product.image or "🍽️",
+                "units": 0,
+                "revenue": 0.0,
+                "cost": 0.0,
+                "_supplies": {},
+            })
             d["units"] += ln.quantity
             d["revenue"] += float(ln.quantity) * float(ln.unit_price)
 
@@ -1084,18 +1093,43 @@ class DishConsumptionView(drf_views.APIView):
                     continue
                 effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
                 consumed = (effective / portions) * float(ln.quantity)
+                cost = consumed * float(ing.item.cost) if ing.item else 0.0
+                name = ing.item.name if ing.item else (ing.name or "—")
+                unit = ing.item.unit if ing.item else (ing.unit or "")
+
+                # Global (todos los platos sumados).
                 s = supply_agg.setdefault(ing.item_id, {
-                    "id": str(ing.item_id),
-                    "name": ing.item.name if ing.item else (ing.name or "—"),
-                    "unit": ing.item.unit if ing.item else (ing.unit or ""),
-                    "consumed": 0.0,
-                    "cost": 0.0,
+                    "id": str(ing.item_id), "name": name, "unit": unit,
+                    "consumed": 0.0, "cost": 0.0,
                 })
                 s["consumed"] += consumed
-                if ing.item:
-                    s["cost"] += consumed * float(ing.item.cost)
+                s["cost"] += cost
 
-        dishes = sorted(dish_agg.values(), key=lambda x: x["units"], reverse=True)
+                # Por plato.
+                ds = d["_supplies"].setdefault(ing.item_id, {
+                    "id": str(ing.item_id), "name": name, "unit": unit,
+                    "consumed": 0.0, "cost": 0.0,
+                })
+                ds["consumed"] += consumed
+                ds["cost"] += cost
+                d["cost"] += cost
+
+        dishes = []
+        for d in sorted(dish_agg.values(), key=lambda x: x["units"], reverse=True):
+            sup = sorted(d["_supplies"].values(), key=lambda x: x["consumed"], reverse=True)
+            dishes.append({
+                "id": d["id"],
+                "name": d["name"],
+                "emoji": d["emoji"],
+                "units": d["units"],
+                "revenue": round(d["revenue"], 0),
+                "cost": round(d["cost"], 0),
+                "supplies": [
+                    {**x, "consumed": round(x["consumed"], 3), "cost": round(x["cost"], 0)}
+                    for x in sup
+                ],
+            })
+
         supplies = sorted(supply_agg.values(), key=lambda x: x["consumed"], reverse=True)
 
         return response.Response({
