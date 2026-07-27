@@ -33,10 +33,26 @@ class CategorySerializer(serializers.ModelSerializer):
 
 class ProductSerializer(serializers.ModelSerializer):
     prepMinutes = serializers.IntegerField(source="prep_minutes")
+    # Filtramos el queryset de categoría por el tenant del usuario autenticado.
+    # Sin esto, DRF valida `category` contra TODAS las categorías (incluidas las
+    # de otros restaurantes), lo que produce errores 400 confusos ("Clave
+    # primaria inválida") y, peor, permitiría vincular un producto a la
+    # categoría de otro tenant.
+    category = serializers.PrimaryKeyRelatedField(queryset=models.Category.objects.all())
 
     class Meta:
         model = models.Product
         fields = ["id", "name", "description", "price", "category", "image", "tags", "available", "prepMinutes", "popular", "restockable"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if request is not None:
+            # resolve_tenant_id se importa aquí para evitar import circular.
+            from .views import resolve_tenant_id
+            tenant_id = resolve_tenant_id(request.user)
+            if tenant_id:
+                self.fields["category"].queryset = models.Category.objects.filter(tenant_id=tenant_id)
 
 
 class InventoryItemSerializer(serializers.ModelSerializer):
