@@ -1012,12 +1012,54 @@ class PublicMenuView(drf_views.APIView):
         })
 
 
+class PublicTableView(drf_views.APIView):
+    """
+    GET /api/v1/public/<slug>/table/<number>/ — Estado de una mesa para el QR.
+
+    Indica al cliente si puede hacer pedido web desde esa mesa o si está
+    bloqueada porque un mesero ya tomó el pedido (canal dine_in). Si la mesa
+    ya tiene un pedido web, el cliente puede seguir agregando a esa misma orden.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, slug, number):
+        try:
+            tenant = models.Tenant.objects.get(slug=slug)
+        except models.Tenant.DoesNotExist:
+            return response.Response({"error": "Restaurante no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+        table = models.Table.objects.filter(tenant=tenant, number=number).first()
+        if not table:
+            return response.Response({"error": "Mesa no encontrada"}, status=status.HTTP_404_NOT_FOUND)
+
+        active = models.Order.objects.filter(
+            tenant=tenant, table=table, status__in=("pending", "preparing", "ready", "served"),
+        )
+        has_dine_in = active.filter(channel="dine_in").exists()
+        web_order = active.filter(channel="web").first()
+
+        return response.Response({
+            "table": table.number,
+            # El cliente solo puede pedir web si NO hay un Order dine_in activo.
+            "canOrder": not has_dine_in,
+            "hasDineIn": has_dine_in,
+            # Si ya hay un Order web, el cliente agrega a esa orden (no crea otra).
+            "webOrderId": str(web_order.id) if web_order else None,
+            "webOrderCode": web_order.code if web_order else None,
+        })
+
+
 class PublicOrderView(drf_views.APIView):
     """
     POST /api/v1/public/<slug>/order/ — Pedido web desde la carta (cliente).
     No requiere autenticación. Asocia la mesa y emite el ticket al KDS vía WS.
 
     Body: { table: <numero>, items: [{ productId, quantity, notes }], customer?, phone? }
+
+    Regla de mesa (anti-cruce de pedidos):
+      - Si la mesa ya tiene un Order activo del mesero (canal dine_in), se
+        RECHAZA el pedido web (409) para evitar duplicar la cuenta.
+      - Si la mesa ya tiene un Order web activo, se SUMAN las líneas a esa orden.
+      - Si la mesa no tiene ningún order activo, se crea uno nuevo.
     """
     permission_classes = [permissions.AllowAny]
 
@@ -1036,16 +1078,42 @@ class PublicOrderView(drf_views.APIView):
         if table_number is not None:
             table = models.Table.objects.filter(tenant=tenant, number=table_number).first()
 
-        # Correlativo POR TENANT: con el conteo global los códigos se repetían
-        # y se mezclaban entre restaurantes.
+        merged = False
+        # Las comprobaciones van DENTRO de la transacción: dos clientes de la
+        # misma mesa escaneando a la vez podrían saltarse el bloqueo.
         with transaction.atomic():
-            seq = models.Order.objects.filter(tenant=tenant, channel="web").count() + 1
-            code = f"WEB-{seq:04d}"
-            order = models.Order.objects.create(
-                tenant=tenant, code=code, table=table, channel="web", status="pending",
-                customer=request.data.get("customer", "")[:120],
-                phone=request.data.get("phone", "")[:30],
-            )
+            if table is not None:
+                active = ("pending", "preparing", "ready", "served")
+                # Anti-cruce: la mesa ya la atiende el mesero → se bloquea la web.
+                if models.Order.objects.select_for_update().filter(
+                    tenant=tenant, table=table, channel="dine_in", status__in=active,
+                ).exists():
+                    return response.Response(
+                        {"error": "El mesero ya tomó el pedido de esta mesa. Pídele que agregue lo que falta."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                # Solo se suma a un pedido web que la cocina aún no cerró: si ya
+                # está listo/servido su inventario ya se descontó (stock_consumed)
+                # y las líneas nuevas nunca se descontarían. Ese caso abre ronda nueva.
+                existing_web_order = models.Order.objects.select_for_update().filter(
+                    tenant=tenant, table=table, channel="web",
+                    status__in=("pending", "preparing"), stock_consumed=False,
+                ).order_by("created_at").first()
+            else:
+                existing_web_order = None
+
+            if existing_web_order:
+                order = existing_web_order
+                merged = True
+            else:
+                # Correlativo POR TENANT: con el conteo global los códigos se
+                # repetían y se mezclaban entre restaurantes.
+                seq = models.Order.objects.filter(tenant=tenant, channel="web").count() + 1
+                order = models.Order.objects.create(
+                    tenant=tenant, code=f"WEB-{seq:04d}", table=table, channel="web", status="pending",
+                    customer=request.data.get("customer", "")[:120],
+                    phone=request.data.get("phone", "")[:30],
+                )
             created_lines = 0
             for it in items:
                 try:
@@ -1060,20 +1128,33 @@ class PublicOrderView(drf_views.APIView):
                 )
                 created_lines += 1
 
-        if created_lines == 0:
-            order.delete()
-            return response.Response(
-                {"error": "Ningún producto válido en el pedido"}, status=status.HTTP_400_BAD_REQUEST
-            )
+            if created_lines == 0:
+                if not merged:
+                    order.delete()
+                return response.Response(
+                    {"error": "Ningún producto válido en el pedido"}, status=status.HTTP_400_BAD_REQUEST
+                )
+
+            if merged:
+                # Deja rastro de que el cliente amplió un pedido ya enviado.
+                models.OrderChangeLog.objects.create(
+                    tenant=tenant, order=order, action="add", user="Cliente (web)",
+                    summary=f"+{created_lines} producto(s) desde la carta web",
+                    detail={"addedLines": created_lines},
+                )
 
         avg_wait = estimate_wait_minutes(tenant, order)
 
-        # Avisa al POS y al KDS en tiempo real.
+        # Avisa al POS y al KDS en tiempo real. Al sumar líneas a un ticket que
+        # la cocina ya tiene hay que emitir "update": con "new" el KDS lo
+        # descarta por id repetido y los productos añadidos no se verían.
         try:
             layer = get_channel_layer()
+            payload = serializers.OrderSerializer(order).data
             async_to_sync(layer.group_send)(
                 f"kitchen_{tenant.id}",
-                {"type": "ticket.new", "ticket": serializers.OrderSerializer(order).data},
+                {"type": "ticket.update", "payload": payload} if merged
+                else {"type": "ticket.new", "ticket": payload},
             )
         except Exception:
             pass
@@ -1082,6 +1163,8 @@ class PublicOrderView(drf_views.APIView):
             "orderId": str(order.id), "code": order.code,
             "table": table.number if table else None,
             "status": order.status, "estimatedWait": avg_wait,
+            # true = se sumó a un pedido que la mesa ya tenía abierto.
+            "merged": merged,
         }, status=status.HTTP_201_CREATED)
 
 
