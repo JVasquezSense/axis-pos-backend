@@ -31,8 +31,24 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = ["id", "name", "icon", "count"]
 
 
+class ComboItemSerializer(serializers.ModelSerializer):
+    productId = serializers.PrimaryKeyRelatedField(source="product", queryset=models.Product.objects.all())
+    name = serializers.CharField(source="product.name", read_only=True)
+    price = serializers.DecimalField(source="product.price", max_digits=12, decimal_places=2, read_only=True)
+    image = serializers.CharField(source="product.image", read_only=True)
+    available = serializers.BooleanField(source="product.available", read_only=True)
+
+    class Meta:
+        model = models.ComboItem
+        fields = ["id", "productId", "name", "price", "image", "available", "quantity"]
+
+
 class ProductSerializer(serializers.ModelSerializer):
     prepMinutes = serializers.IntegerField(source="prep_minutes")
+    isCombo = serializers.BooleanField(source="is_combo", required=False)
+    comboItems = ComboItemSerializer(source="combo_items", many=True, required=False)
+    # Suma de los componentes: permite mostrar el ahorro frente al precio del combo.
+    componentsTotal = serializers.SerializerMethodField()
     # Filtramos el queryset de categoría por el tenant del usuario autenticado.
     # Sin esto, DRF valida `category` contra TODAS las categorías (incluidas las
     # de otros restaurantes), lo que produce errores 400 confusos ("Clave
@@ -42,7 +58,13 @@ class ProductSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.Product
-        fields = ["id", "name", "description", "price", "category", "image", "tags", "available", "prepMinutes", "popular", "restockable"]
+        fields = ["id", "name", "description", "price", "category", "image", "tags", "available",
+                  "prepMinutes", "popular", "restockable", "isCombo", "comboItems", "componentsTotal"]
+
+    def get_componentsTotal(self, obj):
+        if not obj.is_combo:
+            return None
+        return round(sum(float(ci.product.price) * ci.quantity for ci in obj.combo_items.all()), 2)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -52,7 +74,37 @@ class ProductSerializer(serializers.ModelSerializer):
             from .views import resolve_tenant_id
             tenant_id = resolve_tenant_id(request.user)
             if tenant_id:
+                qs = models.Product.objects.filter(tenant_id=tenant_id)
                 self.fields["category"].queryset = models.Category.objects.filter(tenant_id=tenant_id)
+                # Un combo solo puede contener productos del mismo restaurante
+                # y nunca otro combo (evita anidamiento y ciclos).
+                self.fields["comboItems"].child.fields["productId"].queryset = qs.filter(is_combo=False)
+
+    def _sync_combo_items(self, product, items_data):
+        product.combo_items.all().delete()
+        for it in items_data:
+            comp = it["product"]
+            if comp.pk == product.pk:
+                continue  # un combo no puede contenerse a sí mismo
+            models.ComboItem.objects.create(
+                combo=product, product=comp, quantity=max(int(it.get("quantity", 1)), 1)
+            )
+
+    def create(self, validated_data):
+        items_data = validated_data.pop("combo_items", None)
+        product = models.Product.objects.create(**validated_data)
+        if items_data is not None:
+            self._sync_combo_items(product, items_data)
+        return product
+
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop("combo_items", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        if items_data is not None:
+            self._sync_combo_items(instance, items_data)
+        return instance
 
 
 class InventoryItemSerializer(serializers.ModelSerializer):

@@ -96,6 +96,30 @@ class Product(TenantScoped):
     # Backlog #6: si el producto se devuelve, ¿reintegra stock? (bebida sellada sí,
     # comida preparada no). Por defecto reintegra (productos sellados).
     restockable = models.BooleanField(default=True)
+    # Un combo es un Product vendible cuyo contenido son otros productos
+    # (ver ComboItem). Modelarlo así deja intacto todo lo que ya consume
+    # Product: pedidos, KDS, ventas, carta pública y reportes.
+    is_combo = models.BooleanField(default=False)
+
+    def components_total(self):
+        """Suma del precio de los componentes (precio del combo si no lo es)."""
+        if not self.is_combo:
+            return float(self.price)
+        return sum(float(ci.product.price) * ci.quantity for ci in self.combo_items.all())
+
+
+class ComboItem(models.Model):
+    """Producto que compone un combo, con su cantidad."""
+    combo = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="combo_items")
+    # PROTECT: no se puede borrar un producto que forma parte de un combo.
+    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="in_combos")
+    quantity = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        unique_together = ("combo", "product")
+
+    def __str__(self):
+        return f"{self.quantity}× {self.product.name} en {self.combo.name}"
 
 
 class InventoryItem(TenantScoped):

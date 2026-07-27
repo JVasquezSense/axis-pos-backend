@@ -35,6 +35,25 @@ def resolve_tenant_id(user):
     return None
 
 
+def expand_products(pairs):
+    """
+    Expande (producto, cantidad) resolviendo combos en sus componentes.
+
+    Devuelve {product_id: cantidad_total} solo con productos reales (no combos),
+    que son los que tienen receta y por tanto descuentan inventario.
+    """
+    demand = {}
+    for product, qty in pairs:
+        if product is None or qty is None:
+            continue
+        if getattr(product, "is_combo", False):
+            for ci in product.combo_items.select_related("product").all():
+                demand[ci.product_id] = demand.get(ci.product_id, 0) + ci.quantity * float(qty)
+        else:
+            demand[product.id] = demand.get(product.id, 0) + float(qty)
+    return demand
+
+
 def consume_order_inventory(order):
     """
     Descuenta del inventario los insumos consumidos por una orden, cruzando
@@ -57,18 +76,21 @@ def consume_order_inventory(order):
         order.save(update_fields=["stock_consumed"])
         return
 
+    # Un combo no tiene receta propia: se expande en sus componentes para que
+    # descuenten el inventario de cada uno.
+    demand = expand_products(((ln.product, ln.quantity) for ln in lines))
+
     # Receta por producto (un producto -> su ficha técnica). 1:1 esperado.
-    product_ids = [ln.product_id for ln in lines]
     recipes = {
         r.product_id: r
-        for r in models.Recipe.objects.filter(product_id__in=product_ids).prefetch_related("ingredients")
+        for r in models.Recipe.objects.filter(product_id__in=demand.keys()).prefetch_related("ingredients")
         if r.product_id is not None
     }
 
     # Acumula consumo total por insumo (sumando todas las líneas de la orden).
     consumption = {}  # {inventory_item_id: cantidad_total}
-    for ln in lines:
-        recipe = recipes.get(ln.product_id)
+    for product_id, qty in demand.items():
+        recipe = recipes.get(product_id)
         if not recipe:
             continue
         portions = max(recipe.portions, 1)
@@ -77,7 +99,7 @@ def consume_order_inventory(order):
                 continue
             # Cantidad por porción ya considerando el desperdicio (waste 0..1).
             effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
-            consumed = (effective / portions) * float(ln.quantity)
+            consumed = (effective / portions) * float(qty)
             consumption[ing.item_id] = consumption.get(ing.item_id, 0) + consumed
 
     if not consumption:
@@ -156,6 +178,26 @@ def sync_products_availability(item_ids):
             changed.append({"id": str(product.id), "available": available})
             tenant_id = product.tenant_id
 
+    # Un combo se agota si alguno de sus componentes ya no se puede preparar.
+    touched_ids = {c["id"] for c in changed}
+    if touched_ids:
+        combos = (
+            models.Product.objects
+            .filter(is_combo=True, combo_items__product_id__in=touched_ids)
+            .distinct()
+            .prefetch_related("combo_items__product")
+        )
+        for combo in combos:
+            items = list(combo.combo_items.all())
+            if not items:
+                continue
+            available = all(ci.product.available for ci in items)
+            if combo.available != available:
+                combo.available = available
+                combo.save(update_fields=["available"])
+                changed.append({"id": str(combo.id), "available": available})
+                tenant_id = combo.tenant_id
+
     # Notifica en vivo a las pantallas (menú/pedidos) del restaurante.
     if changed and tenant_id is not None:
         try:
@@ -202,7 +244,7 @@ class CategoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
 
 
 class ProductViewSet(TenantQuerySet, viewsets.ModelViewSet):
-    queryset = models.Product.objects.select_related("category")
+    queryset = models.Product.objects.select_related("category").prefetch_related("combo_items__product")
     serializer_class = serializers.ProductSerializer
 
 
@@ -1244,10 +1286,17 @@ class DishConsumptionView(drf_views.APIView):
             .filter(order__created_at__date__gte=start, order__created_at__date__lte=end)
             .exclude(order__status="pending")
             .select_related("product")
+            .prefetch_related("product__combo_items__product")
         )
 
-        # Recetas del tenant indexadas por producto: {product_id: (portions, [ingredients])}
-        product_ids = {ln.product_id for ln in lines}
+        # Recetas del tenant indexadas por producto. Se incluyen los componentes
+        # de los combos: el combo no tiene receta propia, consume la de sus partes.
+        product_ids = set()
+        for ln in lines:
+            if ln.product.is_combo:
+                product_ids.update(ci.product_id for ci in ln.product.combo_items.all())
+            else:
+                product_ids.add(ln.product_id)
         recipe_map = {}
         for r in models.Recipe.objects.filter(product_id__in=product_ids, tenant_id=tenant_id).prefetch_related("ingredients__item"):
             if r.product_id is not None and r.product_id not in recipe_map:
@@ -1272,35 +1321,37 @@ class DishConsumptionView(drf_views.APIView):
             d["units"] += ln.quantity
             d["revenue"] += float(ln.quantity) * float(ln.unit_price)
 
-            ings_portions = recipe_map.get(pid)
-            if not ings_portions:
-                continue
-            portions, ings = ings_portions
-            for ing in ings:
-                if ing.item_id is None:
+            # Un combo aporta el consumo de sus componentes, atribuido al combo.
+            for comp_id, comp_qty in expand_products([(ln.product, ln.quantity)]).items():
+                ings_portions = recipe_map.get(comp_id)
+                if not ings_portions:
                     continue
-                effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
-                consumed = (effective / portions) * float(ln.quantity)
-                cost = consumed * float(ing.item.cost) if ing.item else 0.0
-                name = ing.item.name if ing.item else (ing.name or "—")
-                unit = ing.item.unit if ing.item else (ing.unit or "")
+                portions, ings = ings_portions
+                for ing in ings:
+                    if ing.item_id is None:
+                        continue
+                    effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
+                    consumed = (effective / portions) * float(comp_qty)
+                    cost = consumed * float(ing.item.cost) if ing.item else 0.0
+                    name = ing.item.name if ing.item else (ing.name or "—")
+                    unit = ing.item.unit if ing.item else (ing.unit or "")
 
-                # Global (todos los platos sumados).
-                s = supply_agg.setdefault(ing.item_id, {
-                    "id": str(ing.item_id), "name": name, "unit": unit,
-                    "consumed": 0.0, "cost": 0.0,
-                })
-                s["consumed"] += consumed
-                s["cost"] += cost
+                    # Global (todos los platos sumados).
+                    s = supply_agg.setdefault(ing.item_id, {
+                        "id": str(ing.item_id), "name": name, "unit": unit,
+                        "consumed": 0.0, "cost": 0.0,
+                    })
+                    s["consumed"] += consumed
+                    s["cost"] += cost
 
-                # Por plato.
-                ds = d["_supplies"].setdefault(ing.item_id, {
-                    "id": str(ing.item_id), "name": name, "unit": unit,
-                    "consumed": 0.0, "cost": 0.0,
-                })
-                ds["consumed"] += consumed
-                ds["cost"] += cost
-                d["cost"] += cost
+                    # Por plato (el combo acumula el de sus componentes).
+                    ds = d["_supplies"].setdefault(ing.item_id, {
+                        "id": str(ing.item_id), "name": name, "unit": unit,
+                        "consumed": 0.0, "cost": 0.0,
+                    })
+                    ds["consumed"] += consumed
+                    ds["cost"] += cost
+                    d["cost"] += cost
 
         dishes = []
         for d in sorted(dish_agg.values(), key=lambda x: x["units"], reverse=True):
