@@ -272,6 +272,10 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
         table_param = self.request.query_params.get("table")
         if table_param:
             qs = qs.filter(table__number=table_param)
+        # Filtro por canal (p. ej. ?channel=web para el feed de pedidos web).
+        channel_param = self.request.query_params.get("channel")
+        if channel_param:
+            qs = qs.filter(channel__in=[c.strip() for c in channel_param.split(",") if c.strip()])
         return qs
 
     def perform_create(self, serializer):
