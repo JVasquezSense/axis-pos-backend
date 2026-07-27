@@ -1104,7 +1104,7 @@ class PublicOrderStatusView(drf_views.APIView):
             "table": order.table.number if order.table else None,
             "estimatedWait": wait,
             "items": [
-                {"name": l.product.name, "quantity": l.quantity}
+                {"name": l.product.name, "quantity": l.quantity, "notes": l.notes}
                 for l in order.lines.select_related("product").all()
             ],
             "createdAt": order.created_at.isoformat(),
