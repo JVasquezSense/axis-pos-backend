@@ -956,6 +956,27 @@ class ReportsView(drf_views.APIView):
         })
 
 
+def estimate_wait_minutes(tenant, order=None):
+    """
+    Tiempo estimado de espera (min) para un pedido web.
+
+    Se basa en el plato que más tarda del propio pedido más un recargo por la
+    cola que tiene delante, en vez de multiplicar ciegamente por el total de
+    órdenes activas (que daba estimaciones absurdas: 12 pedidos → 144 min).
+    """
+    base = 10
+    if order is not None:
+        preps = [ln.product.prep_minutes for ln in order.lines.select_related("product").all()]
+        if preps:
+            base = max(preps)
+    qs = models.Order.objects.filter(tenant=tenant, status__in=["pending", "preparing"])
+    if order is not None:
+        qs = qs.filter(created_at__lt=order.created_at)
+    queue_ahead = qs.count()
+    # Cocina en paralelo: cada pedido en cola suma solo unos minutos.
+    return int(min(base + queue_ahead * 3, 120))
+
+
 class PublicMenuView(drf_views.APIView):
     """
     GET /api/v1/public/<slug>/menu/ — Carta pública de un restaurante por slug.
@@ -1006,27 +1027,37 @@ class PublicOrderView(drf_views.APIView):
         if table_number is not None:
             table = models.Table.objects.filter(tenant=tenant, number=table_number).first()
 
-        code = f"WEB-{models.Order.objects.count() + 1:04d}"
-        order = models.Order.objects.create(
-            tenant=tenant, code=code, table=table, channel="web", status="pending",
-            customer=request.data.get("customer", "")[:120],
-            phone=request.data.get("phone", "")[:30],
-        )
-        for it in items:
-            try:
-                product = models.Product.objects.get(pk=it.get("productId"), tenant=tenant)
-            except (models.Product.DoesNotExist, ValueError, TypeError):
-                continue
-            models.OrderLine.objects.create(
-                order=order, product=product,
-                quantity=max(int(it.get("quantity", 1)), 1),
-                notes=(it.get("notes") or "")[:200],
-                unit_price=product.price,
+        # Correlativo POR TENANT: con el conteo global los códigos se repetían
+        # y se mezclaban entre restaurantes.
+        with transaction.atomic():
+            seq = models.Order.objects.filter(tenant=tenant, channel="web").count() + 1
+            code = f"WEB-{seq:04d}"
+            order = models.Order.objects.create(
+                tenant=tenant, code=code, table=table, channel="web", status="pending",
+                customer=request.data.get("customer", "")[:120],
+                phone=request.data.get("phone", "")[:30],
+            )
+            created_lines = 0
+            for it in items:
+                try:
+                    product = models.Product.objects.get(pk=it.get("productId"), tenant=tenant)
+                except (models.Product.DoesNotExist, ValueError, TypeError):
+                    continue
+                models.OrderLine.objects.create(
+                    order=order, product=product,
+                    quantity=max(int(it.get("quantity", 1)), 1),
+                    notes=(it.get("notes") or "")[:200],
+                    unit_price=product.price,
+                )
+                created_lines += 1
+
+        if created_lines == 0:
+            order.delete()
+            return response.Response(
+                {"error": "Ningún producto válido en el pedido"}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Tiempo promedio de espera basado en órdenes activas (backlog #8).
-        active = models.Order.objects.filter(tenant=tenant, status__in=["pending", "preparing"]).count()
-        avg_wait = active * 12  # estimación: 12 min por orden en cola
+        avg_wait = estimate_wait_minutes(tenant, order)
 
         # Avisa al POS y al KDS en tiempo real.
         try:
@@ -1057,11 +1088,12 @@ class PublicOrderStatusView(drf_views.APIView):
             order = models.Order.objects.get(pk=order_id)
         except (models.Order.DoesNotExist, ValueError):
             return response.Response({"error": "Pedido no encontrado"}, status=status.HTTP_404_NOT_FOUND)
-        active = models.Order.objects.filter(tenant=order.tenant, status__in=["pending", "preparing"]).count()
+        # Ya preparado: no tiene sentido seguir mostrando espera.
+        wait = 0 if order.status in ("ready", "served", "paid") else estimate_wait_minutes(order.tenant, order)
         return response.Response({
             "id": str(order.id), "code": order.code, "status": order.status,
             "table": order.table.number if order.table else None,
-            "estimatedWait": active * 12,
+            "estimatedWait": wait,
             "items": [
                 {"name": l.product.name, "quantity": l.quantity}
                 for l in order.lines.select_related("product").all()
