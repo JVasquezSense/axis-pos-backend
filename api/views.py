@@ -463,6 +463,11 @@ class MeView(drf_views.APIView):
             "role": getattr(profile, "role", None),
             "tenantId": str(tenant.id) if tenant else None,
             "tenantName": tenant.name if tenant else None,
+            # El frontend necesita el slug para construir el QR por mesa y el
+            # enlace a la carta pública (/restaurant/<slug>).
+            "tenantSlug": tenant.slug if tenant else None,
+            "tenantLogo": tenant.logo if tenant else None,
+            "tenantPlan": tenant.plan if tenant else None,
             "resolvedTenantId": str(resolved) if resolved else None,
         })
 
