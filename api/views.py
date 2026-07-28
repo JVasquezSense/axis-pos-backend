@@ -244,7 +244,7 @@ class CategoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
 
 
 class ProductViewSet(TenantQuerySet, viewsets.ModelViewSet):
-    queryset = models.Product.objects.select_related("category").prefetch_related("combo_items__product")
+    queryset = models.Product.objects.select_related("category").prefetch_related("combo_items__product", "recipes")
     serializer_class = serializers.ProductSerializer
 
 
@@ -1091,7 +1091,8 @@ class PublicMenuView(drf_views.APIView):
         except models.Tenant.DoesNotExist:
             return response.Response({"error": "Restaurante no encontrado"}, status=status.HTTP_404_NOT_FOUND)
         cats = models.Category.objects.filter(tenant=tenant)
-        products = models.Product.objects.filter(tenant=tenant, available=True).select_related("category")
+        products = (models.Product.objects.filter(tenant=tenant, available=True)
+                    .select_related("category").prefetch_related("combo_items__product", "recipes"))
         tables = models.Table.objects.filter(tenant=tenant).values("id", "number")
         return response.Response({
             "restaurant": {

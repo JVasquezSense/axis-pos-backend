@@ -49,6 +49,9 @@ class ProductSerializer(serializers.ModelSerializer):
     comboItems = ComboItemSerializer(source="combo_items", many=True, required=False)
     # Suma de los componentes: permite mostrar el ahorro frente al precio del combo.
     componentsTotal = serializers.SerializerMethodField()
+    # Variaciones de la ficha técnica (ej. "Doble carne" +$8.000). Se exponen en
+    # el producto para poder elegirlas al pedir, tanto en el POS como en la web.
+    variations = serializers.SerializerMethodField()
     # Filtramos el queryset de categoría por el tenant del usuario autenticado.
     # Sin esto, DRF valida `category` contra TODAS las categorías (incluidas las
     # de otros restaurantes), lo que produce errores 400 confusos ("Clave
@@ -59,7 +62,26 @@ class ProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Product
         fields = ["id", "name", "description", "price", "category", "image", "tags", "available",
-                  "prepMinutes", "popular", "restockable", "isCombo", "comboItems", "componentsTotal"]
+                  "prepMinutes", "popular", "restockable", "isCombo", "comboItems", "componentsTotal",
+                  "variations"]
+
+    def get_variations(self, obj):
+        recipe = next(iter(obj.recipes.all()), None)
+        if recipe is None:
+            return []
+        out = []
+        for i, v in enumerate(recipe.variations or []):
+            if not isinstance(v, dict):
+                continue
+            name = str(v.get("name") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "id": str(v.get("id") or f"var-{i}"),
+                "name": name,
+                "priceDelta": float(v.get("priceDelta") or 0),
+            })
+        return out
 
     def get_componentsTotal(self, obj):
         if not obj.is_combo:
