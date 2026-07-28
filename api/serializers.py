@@ -541,6 +541,82 @@ class CreditNoteLineSerializer(serializers.ModelSerializer):
         fields = ["id", "productId", "productName", "quantity", "unitPrice", "restocked"]
 
 
+class AuditLogSerializer(serializers.ModelSerializer):
+    # El frontend usa epoch ms para ordenar/filtrar.
+    ts = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.AuditLog
+        fields = ["id", "action", "details", "user", "module", "ts"]
+
+    def get_ts(self, obj):
+        return int(obj.created_at.timestamp() * 1000)
+
+
+class ShiftCloseSerializer(serializers.ModelSerializer):
+    sales = serializers.DecimalField(source="sales_total", max_digits=14, decimal_places=2)
+    avg = serializers.DecimalField(source="avg_ticket", max_digits=14, decimal_places=2, required=False)
+    totalTips = serializers.DecimalField(source="total_tips", max_digits=12, decimal_places=2, required=False)
+    byMethod = serializers.JSONField(source="by_method", required=False)
+    byWaiter = serializers.JSONField(source="by_waiter", required=False)
+    closedBy = serializers.CharField(source="closed_by", required=False, allow_blank=True)
+    ts = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.ShiftClose
+        fields = ["id", "sales", "orders", "avg", "totalTips", "byMethod", "byWaiter",
+                  "closedBy", "records", "ts"]
+
+    def get_ts(self, obj):
+        return int(obj.created_at.timestamp() * 1000)
+
+
+class DeliverySerializer(serializers.ModelSerializer):
+    customerName = serializers.CharField(source="customer_name")
+    customerPhone = serializers.CharField(source="customer_phone", required=False, allow_blank=True)
+    driverId = serializers.PrimaryKeyRelatedField(
+        source="driver", queryset=models.Employee.objects.all(),
+        required=False, allow_null=True,
+    )
+    driverName = serializers.CharField(source="driver_name", required=False, allow_blank=True)
+    paymentMethod = serializers.CharField(source="payment_method", required=False, allow_blank=True)
+    createdAt = serializers.SerializerMethodField()
+    assignedAt = serializers.SerializerMethodField()
+    pickedUpAt = serializers.SerializerMethodField()
+    deliveredAt = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.Delivery
+        fields = ["id", "code", "customerName", "customerPhone", "address", "neighborhood",
+                  "lat", "lng", "items", "total", "tip", "status", "driverId", "driverName",
+                  "notes", "paymentMethod", "createdAt", "assignedAt", "pickedUpAt", "deliveredAt"]
+
+    @staticmethod
+    def _ms(dt):
+        return int(dt.timestamp() * 1000) if dt else None
+
+    def get_createdAt(self, obj):
+        return self._ms(obj.created_at)
+
+    def get_assignedAt(self, obj):
+        return self._ms(obj.assigned_at)
+
+    def get_pickedUpAt(self, obj):
+        return self._ms(obj.picked_up_at)
+
+    def get_deliveredAt(self, obj):
+        return self._ms(obj.delivered_at)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if request is not None:
+            from .views import resolve_tenant_id
+            tenant_id = resolve_tenant_id(request.user)
+            if tenant_id:
+                self.fields["driverId"].queryset = models.Employee.objects.filter(tenant_id=tenant_id)
+
+
 class CreditNoteSerializer(serializers.ModelSerializer):
     lines = CreditNoteLineSerializer(many=True)
     createdAt = serializers.DateTimeField(source="created_at", read_only=True)

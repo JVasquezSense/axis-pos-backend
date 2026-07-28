@@ -358,6 +358,79 @@ class Sale(TenantScoped):
 
 # ─── Devoluciones (Notas de Crédito) ──────────────────────────────────────────
 
+class AuditLog(TenantScoped):
+    """Bitácora de acciones del panel. Antes vivía solo en memoria del navegador."""
+    MODULE = [
+        ("ventas", "Ventas"), ("inventario", "Inventario"), ("menu", "Menú"),
+        ("proveedores", "Proveedores"), ("reservaciones", "Reservaciones"),
+        ("mesas", "Mesas"), ("empleados", "Empleados"), ("sistema", "Sistema"),
+    ]
+    action = models.CharField(max_length=120)
+    details = models.CharField(max_length=300, blank=True)
+    user = models.CharField(max_length=80, blank=True)
+    module = models.CharField(max_length=20, choices=MODULE, default="sistema")
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.action} · {self.module}"
+
+
+class ShiftClose(TenantScoped):
+    """Cierre de turno: totales del turno y snapshot de las ventas incluidas."""
+    sales_total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    orders = models.PositiveIntegerField(default=0)
+    avg_ticket = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    total_tips = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    by_method = models.JSONField(default=dict)
+    by_waiter = models.JSONField(default=dict)
+    closed_by = models.CharField(max_length=80, blank=True)
+    records = models.JSONField(default=list)  # ventas archivadas del turno
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Turno {self.created_at:%Y-%m-%d %H:%M} · ${self.sales_total}"
+
+
+class Delivery(TenantScoped):
+    """Domicilio: pedido a domicilio con su repartidor y seguimiento de estado."""
+    STATUS = [
+        ("pending", "Pendiente"), ("assigned", "Asignado"), ("picked_up", "Recogido"),
+        ("on_the_way", "En camino"), ("arrived", "En sitio"),
+        ("delivered", "Entregado"), ("cancelled", "Cancelado"),
+    ]
+    code = models.CharField(max_length=20)
+    customer_name = models.CharField(max_length=120)
+    customer_phone = models.CharField(max_length=30, blank=True)
+    address = models.TextField(blank=True)
+    neighborhood = models.CharField(max_length=120, blank=True)
+    lat = models.FloatField(null=True, blank=True)
+    lng = models.FloatField(null=True, blank=True)
+    items = models.JSONField(default=list)  # [{name, quantity}]
+    total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    tip = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(max_length=12, choices=STATUS, default="pending")
+    driver = models.ForeignKey(Employee, null=True, blank=True, on_delete=models.SET_NULL, related_name="deliveries")
+    driver_name = models.CharField(max_length=120, blank=True)
+    notes = models.TextField(blank=True)
+    payment_method = models.CharField(max_length=20, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    assigned_at = models.DateTimeField(null=True, blank=True)
+    picked_up_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.code} · {self.customer_name}"
+
+
 class CreditNote(TenantScoped):
     """Nota de crédito por devolución de una venta o producto (backlog #6)."""
     code = models.CharField(max_length=24)

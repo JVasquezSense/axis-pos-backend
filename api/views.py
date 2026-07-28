@@ -598,6 +598,56 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
         serializer.save(tenant_id=tenant_id, invoice_number=invoice_number)
 
 
+class AuditLogViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    """Bitácora del panel. Filtrada por tenant; solo lectura + registro."""
+    queryset = models.AuditLog.objects.all()
+    serializer_class = serializers.AuditLogSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        module = self.request.query_params.get("module")
+        if module:
+            qs = qs.filter(module__in=[m.strip() for m in module.split(",") if m.strip()])
+        # Ventana acotada: la bitácora crece rápido y la UI pagina en cliente.
+        try:
+            limit = min(int(self.request.query_params.get("limit", 500)), 2000)
+        except ValueError:
+            limit = 500
+        return qs[:limit]
+
+
+class ShiftCloseViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    """Cierres de turno. Filtrados por tenant."""
+    queryset = models.ShiftClose.objects.all()
+    serializer_class = serializers.ShiftCloseSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+
+class DeliveryViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    """Domicilios. Filtrados por tenant."""
+    queryset = models.Delivery.objects.select_related("driver")
+    serializer_class = serializers.DeliverySerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status__in=[s.strip() for s in status_param.split(",") if s.strip()])
+        return qs
+
+    def perform_update(self, serializer):
+        prev = self.get_object().status
+        delivery = serializer.save()
+        # Sella los hitos del recorrido al cambiar de estado.
+        now = timezone.now()
+        stamps = {"assigned": "assigned_at", "picked_up": "picked_up_at", "delivered": "delivered_at"}
+        field = stamps.get(delivery.status)
+        if field and delivery.status != prev and getattr(delivery, field) is None:
+            setattr(delivery, field, now)
+            delivery.save(update_fields=[field])
+
+
 class CreditNoteViewSet(TenantQuerySet, viewsets.ModelViewSet):
     """Notas de crédito / devoluciones (backlog #6). Filtrado por tenant."""
     queryset = models.CreditNote.objects.prefetch_related("lines").order_by("-created_at")
