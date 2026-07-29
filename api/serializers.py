@@ -447,22 +447,31 @@ class TenantAdminSerializer(serializers.ModelSerializer):
     users = serializers.SerializerMethodField()
     ordersMonth = serializers.SerializerMethodField()
     joinedAt = serializers.DateTimeField(source="created_at", read_only=True)
+    # Lo que realmente aplica = defaults <- plan <- override del restaurante.
+    effectiveFeatures = serializers.SerializerMethodField()
+    maxUsers = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Tenant
         fields = [
             "id", "name", "slug", "logo", "plan", "status", "city",
-            "locations", "features",
+            "locations", "features", "effectiveFeatures", "maxUsers",
             "mrr", "users", "ordersMonth", "joinedAt",
         ]
-        read_only_fields = ["id", "joinedAt", "mrr", "users", "ordersMonth"]
+        read_only_fields = ["id", "joinedAt", "mrr", "users", "ordersMonth",
+                            "effectiveFeatures", "maxUsers"]
+
+    def get_effectiveFeatures(self, obj):
+        return obj.effective_features()
+
+    def get_maxUsers(self, obj):
+        return obj.max_users
 
     def get_mrr(self, obj):
         return PLAN_MRR.get(obj.plan, 0)
 
     def get_users(self, obj):
-        from django.contrib.auth import get_user_model
-        return 1  # sin user-tenant FK aún
+        return models.UserProfile.objects.filter(tenant=obj).count()
 
     def get_ordersMonth(self, obj):
         from django.utils import timezone

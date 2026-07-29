@@ -452,7 +452,14 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
         features = request.data.get("features")
         if not isinstance(features, dict):
             return response.Response({"error": "features must be a dict"}, status=status.HTTP_400_BAD_REQUEST)
-        tenant.features = {**tenant.features, **features}
+        # None = quitar el override y volver a heredar del plan.
+        merged = {**(tenant.features or {})}
+        for key, value in features.items():
+            if value is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        tenant.features = merged
         tenant.save(update_fields=["features"])
         return response.Response(serializers.TenantAdminSerializer(tenant).data)
 
