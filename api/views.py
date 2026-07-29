@@ -1209,6 +1209,9 @@ class PublicMenuView(drf_views.APIView):
             tenant = models.Tenant.objects.get(slug=slug)
         except models.Tenant.DoesNotExist:
             return response.Response({"error": "Restaurante no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+        # La carta pública es parte del plan: sin ella el enlace no existe.
+        if tenant.effective_features().get("website") is not True:
+            return response.Response({"error": "Restaurante no encontrado"}, status=status.HTTP_404_NOT_FOUND)
         cats = models.Category.objects.filter(tenant=tenant)
         products = (models.Product.objects.filter(tenant=tenant, available=True)
                     .select_related("category").prefetch_related("combo_items__product", "recipes"))
@@ -1285,6 +1288,19 @@ class PublicOrderView(drf_views.APIView):
         items = request.data.get("items", [])
         if not items or not isinstance(items, list):
             return response.Response({"error": "items requerido"}, status=status.HTTP_400_BAD_REQUEST)
+
+        feats = tenant.effective_features()
+        if feats.get("weborders") is not True:
+            return response.Response(
+                {"error": "Este restaurante no recibe pedidos por la web"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        # Pedir desde la mesa es la capacidad "qr"; sin ella solo se pide sin mesa.
+        if table_number is not None and feats.get("qr") is not True:
+            return response.Response(
+                {"error": "Este restaurante no acepta pedidos por QR en mesa"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         table = None
         if table_number is not None:
