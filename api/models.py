@@ -10,13 +10,29 @@ from django.db import models
 from django.utils.text import slugify
 
 
+# Secciones de la barra lateral que un plan puede activar/desactivar. Las claves
+# coinciden 1:1 con NAV_ITEMS del frontend (src/lib/nav.ts) para que el mapeo
+# sea directo. "admin" queda fuera: es del superadmin, no de un restaurante.
+NAV_FEATURES = [
+    "dashboard", "salon", "reservations", "orders", "kitchen", "checkout", "shift",
+    "history", "returns", "shift-history", "weborders", "menu", "inventory",
+    "suppliers", "employees", "audit", "crm", "reports", "delivery",
+    "delivery-admin", "website",
+]
+
+# Capacidades que no son secciones del menú lateral.
+CAPABILITY_FEATURES = ["qr", "whatsapp", "ai"]
+
+# Núcleo mínimo: sin esto no se puede operar el restaurante.
+CORE_FEATURES = ["dashboard", "salon", "orders", "kitchen", "checkout"]
+
+
 def _default_features():
-    return {
-        "pos": True, "kitchen": True, "inventory": True,
-        "recipes": True, "salon": True, "reservations": True,
-        "crm": True, "suppliers": True, "employees": True,
-        "reports": True, "website": True, "web_orders": True,
-    }
+    """Base del plan más chico: solo el núcleo operativo."""
+    feats = {k: (k in CORE_FEATURES) for k in NAV_FEATURES}
+    feats.update({k: False for k in CAPABILITY_FEATURES})
+    feats["max_users"] = 2
+    return feats
 
 
 class Tenant(models.Model):
@@ -31,7 +47,9 @@ class Tenant(models.Model):
     status = models.CharField(max_length=20, choices=STATUS, default="trial")
     city = models.CharField(max_length=80, blank=True)
     locations = models.PositiveIntegerField(default=1)
-    features = models.JSONField(default=_default_features)
+    # SOLO overrides explícitos de este restaurante. Si guardara el set completo
+    # de features (como antes), pisaría siempre al plan y el plan no aplicaría.
+    features = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     # Información fiscal para la factura/ticket (backlog #1).
     tax_id = models.CharField(max_length=40, blank=True)        # NIT / RUT
@@ -55,6 +73,45 @@ class Tenant(models.Model):
                 i += 1
             self.slug = candidate
         super().save(*args, **kwargs)
+
+    def effective_features(self):
+        """
+        Features efectivas del restaurante, por precedencia:
+            defaults  ←  plan asignado  ←  overrides de este tenant
+
+        `self.features` guarda SOLO lo que el admin cambió para este
+        restaurante, de modo que todo lo demás lo gobierna el plan.
+        """
+        base = dict(_default_features())
+        plan = Plan.objects.filter(code=self.plan).first()
+        if plan:
+            base.update(plan.features or {})
+            base.setdefault("max_users", plan.max_users)
+            if "max_users" not in (plan.features or {}):
+                base["max_users"] = plan.max_users
+        base.update(self.features or {})
+        return base
+
+    @property
+    def max_users(self):
+        try:
+            return max(int(self.effective_features().get("max_users", 2)), 1)
+        except (TypeError, ValueError):
+            return 2
+
+
+class Plan(models.Model):
+    """Plantilla de features por plan (configuración global del SaaS)."""
+    CODE = [("starter", "Básico"), ("growth", "Pro"), ("enterprise", "Enterprise")]
+    code = models.CharField(max_length=20, choices=CODE, unique=True)
+    name = models.CharField(max_length=60)
+    max_users = models.PositiveIntegerField(default=2)
+    features = models.JSONField(default=_default_features)
+    price = models.PositiveIntegerField(default=0)  # MRR COP
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
 
 
 class UserProfile(models.Model):

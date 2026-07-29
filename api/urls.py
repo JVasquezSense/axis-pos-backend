@@ -30,6 +30,7 @@ urlpatterns = router.urls + [
     path("reports/executive/", views.ReportsView.as_view(), name="reports-executive"),
     path("reports/dish-consumption/", views.DishConsumptionView.as_view(), name="reports-dish-consumption"),
     path("admin/metrics/", views.AdminMetricsView.as_view(), name="admin-metrics"),
+    path("admin/plans/", views.AdminPlansView.as_view(), name="admin-plans"),
     # Endpoints públicos para pedidos web + QR por mesa (backlog #8).
     path("public/<slug>/menu/", views.PublicMenuView.as_view(), name="public-menu"),
     path("public/<slug>/order/", views.PublicOrderView.as_view(), name="public-order"),

@@ -35,6 +35,19 @@ def resolve_tenant_id(user):
     return None
 
 
+def resolve_tenant_features(user):
+    """Features efectivas del tenant del usuario (plan + override).
+    Devuelve None si no se puede resolver el tenant."""
+    tenant_id = resolve_tenant_id(user)
+    if not tenant_id:
+        return None
+    try:
+        tenant = models.Tenant.objects.get(pk=tenant_id)
+        return tenant.effective_features()
+    except models.Tenant.DoesNotExist:
+        return None
+
+
 def expand_products(pairs):
     """
     Expande (producto, cantidad) resolviendo combos en sus componentes.
@@ -221,12 +234,30 @@ class TenantQuerySet:
     Excepción controlada: en un despliegue con un único Tenant se asume ese
     tenant (setup single-tenant / webhooks internos), porque no hay datos de
     terceros que filtrar. Con varios tenants NUNCA se adivina.
+
+    Feature gating: un ViewSet puede declarar `required_feature = "inventory"`
+    y el mixin bloqueará el acceso (queryset vacío + 403 al crear) si esa
+    feature está desactivada en el plan del tenant.
     """
+    # Si se setea, el módulo solo es accesible si la feature del plan está on.
+    required_feature = None
+
+    def _tenant_feature_enabled(self):
+        if not self.required_feature:
+            return True
+        feats = resolve_tenant_features(getattr(self.request, "user", None))
+        if feats is None:
+            return False
+        return bool(feats.get(self.required_feature))
+
     def _resolve_tenant_id(self):
         return resolve_tenant_id(getattr(self.request, "user", None))
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # Feature off: queryset vacío (fail-closed, no expone datos).
+        if not self._tenant_feature_enabled():
+            return qs.none()
         tenant_id = self._resolve_tenant_id()
         return qs.filter(tenant_id=tenant_id) if tenant_id else qs.none()
 
@@ -235,6 +266,9 @@ class TenantQuerySet:
         if not tenant_id:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("No se pudo resolver el restaurante del usuario.")
+        if not self._tenant_feature_enabled():
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Este módulo no está disponible en tu plan.")
         serializer.save(tenant_id=tenant_id)
 
 
@@ -251,6 +285,7 @@ class ProductViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.InventoryItem.objects.all()
     serializer_class = serializers.InventoryItemSerializer
+    required_feature = "inventory"
 
     @decorators.action(detail=False, methods=["get"])
     def movements(self, request):
@@ -294,11 +329,13 @@ class TableViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class RecipeViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Recipe.objects.prefetch_related("ingredients")
     serializer_class = serializers.RecipeSerializer
+    required_feature = "menu"
 
 
 class CustomerViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Customer.objects.all()
     serializer_class = serializers.CustomerSerializer
+    required_feature = "crm"
 
 
 class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
@@ -361,11 +398,13 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class SupplierViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Supplier.objects.all()
     serializer_class = serializers.SupplierSerializer
+    required_feature = "suppliers"
 
 
 class PurchaseViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Purchase.objects.prefetch_related("lines__inventory_item").select_related("supplier")
     serializer_class = serializers.PurchaseSerializer
+    required_feature = "suppliers"
 
 
 # ─── Reservaciones ───────────────────────────────────────────────────────────
@@ -373,6 +412,7 @@ class PurchaseViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class ReservationViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Reservation.objects.all().order_by("date", "time")
     serializer_class = serializers.ReservationSerializer
+    required_feature = "reservations"
 
 
 # ─── Empleados ───────────────────────────────────────────────────────────────
@@ -380,6 +420,7 @@ class ReservationViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class EmployeeViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Employee.objects.all().order_by("name")
     serializer_class = serializers.EmployeeSerializer
+    required_feature = "employees"
 
 
 # ─── Ventas ──────────────────────────────────────────────────────────────────
@@ -391,6 +432,19 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
     queryset = models.Tenant.objects.all().order_by("-created_at")
     serializer_class = serializers.TenantAdminSerializer
     permission_classes = [permissions.IsAdminUser]
+
+    def perform_destroy(self, instance):
+        # Borrar tenant + sus cuentas de usuario (User). El CASCADE de Django
+        # borra los perfiles y datos, pero deja los User huérfanos si no los
+        # eliminamos explícitamente.
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        user_ids = list(
+            models.UserProfile.objects.filter(tenant=instance).values_list("user_id", flat=True)
+        )
+        with transaction.atomic():
+            super().perform_destroy(instance)
+            User.objects.filter(id__in=user_ids).delete()
 
     @decorators.action(detail=True, methods=["patch"], url_path="features")
     def update_features(self, request, pk=None):
@@ -422,6 +476,13 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
             return response.Response({"error": "La contraseña debe tener al menos 8 caracteres"}, status=status.HTTP_400_BAD_REQUEST)
         if User.objects.filter(username=email).exists():
             return response.Response({"error": f"Ya existe un usuario con el email '{email}'"}, status=status.HTTP_400_BAD_REQUEST)
+        # Límite de usuarios por plan (backlog: features por plan).
+        current = models.UserProfile.objects.filter(tenant=tenant).count()
+        if current >= tenant.max_users:
+            return response.Response(
+                {"error": f"El plan de este restaurante permite {tenant.max_users} usuarios (hay {current})."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         try:
             with transaction.atomic():
                 # username = email para que el JWT login funcione con el campo email del formulario
@@ -514,6 +575,10 @@ class MeView(drf_views.APIView):
             "tenantSlug": tenant.slug if tenant else None,
             "tenantLogo": tenant.logo if tenant else None,
             "tenantPlan": tenant.plan if tenant else None,
+            # Features efectivas del plan (para que el frontend restrinja la barra
+            # lateral y los módulos según el plan del restaurante).
+            "tenantFeatures": tenant.effective_features() if tenant else None,
+            "tenantMaxUsers": tenant.max_users if tenant else None,
             "resolvedTenantId": str(resolved) if resolved else None,
         })
 
@@ -577,6 +642,46 @@ class AdminMetricsView(drf_views.APIView):
         })
 
 
+class AdminPlansView(drf_views.APIView):
+    """
+    GET/PATCH /api/v1/admin/plans/ — los 3 planes SaaS y sus features.
+    Solo superadmin: define qué módulos y cuántos usuarios trae cada plan.
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    @staticmethod
+    def _out(p):
+        return {"code": p.code, "name": p.name, "price": p.price,
+                "maxUsers": p.max_users, "features": p.features}
+
+    def get(self, request):
+        plans = models.Plan.objects.all().order_by("price")
+        return response.Response([self._out(p) for p in plans])
+
+    def patch(self, request):
+        """Actualiza un plan: { code, name, price, maxUsers, features }."""
+        code = request.data.get("code")
+        if not code:
+            return response.Response({"error": "code requerido"}, status=status.HTTP_400_BAD_REQUEST)
+        features = request.data.get("features")
+        if not isinstance(features, dict):
+            return response.Response({"error": "features debe ser un dict"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            max_users = max(int(request.data.get("maxUsers", 2)), 1)
+            price = max(int(request.data.get("price", 0)), 0)
+        except (TypeError, ValueError):
+            return response.Response({"error": "maxUsers y price deben ser numéricos"},
+                                     status=status.HTTP_400_BAD_REQUEST)
+        # max_users vive también dentro de features: es lo que lee el tenant.
+        features = {**features, "max_users": max_users}
+        obj, _ = models.Plan.objects.update_or_create(
+            code=code,
+            defaults={"name": request.data.get("name", code), "price": price,
+                      "max_users": max_users, "features": features},
+        )
+        return response.Response(self._out(obj))
+
+
 class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Sale.objects.all().order_by("-created_at")
     serializer_class = serializers.SaleSerializer
@@ -602,6 +707,7 @@ class AuditLogViewSet(TenantQuerySet, viewsets.ModelViewSet):
     """Bitácora del panel. Filtrada por tenant; solo lectura + registro."""
     queryset = models.AuditLog.objects.all()
     serializer_class = serializers.AuditLogSerializer
+    required_feature = "audit"
     http_method_names = ["get", "post", "head", "options"]
 
     def get_queryset(self):
@@ -621,6 +727,7 @@ class ShiftCloseViewSet(TenantQuerySet, viewsets.ModelViewSet):
     """Cierres de turno. Filtrados por tenant."""
     queryset = models.ShiftClose.objects.all()
     serializer_class = serializers.ShiftCloseSerializer
+    required_feature = "shift-history"
     http_method_names = ["get", "post", "head", "options"]
 
 
@@ -628,6 +735,7 @@ class DeliveryViewSet(TenantQuerySet, viewsets.ModelViewSet):
     """Domicilios. Filtrados por tenant."""
     queryset = models.Delivery.objects.select_related("driver")
     serializer_class = serializers.DeliverySerializer
+    required_feature = "delivery-admin"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -652,6 +760,7 @@ class CreditNoteViewSet(TenantQuerySet, viewsets.ModelViewSet):
     """Notas de crédito / devoluciones (backlog #6). Filtrado por tenant."""
     queryset = models.CreditNote.objects.prefetch_related("lines").order_by("-created_at")
     serializer_class = serializers.CreditNoteSerializer
+    required_feature = "returns"
     http_method_names = ["get", "post", "head", "options"]
 
     def perform_create(self, serializer):
@@ -671,6 +780,7 @@ class CreditNoteViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class WhatsAppCustomerViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.WhatsAppCustomer.objects.all().order_by("-last_order_at")
     serializer_class = serializers.WhatsAppCustomerSerializer
+    required_feature = "whatsapp"
 
     @decorators.action(detail=False, methods=["post"], url_path="upsert")
     def upsert(self, request):
@@ -694,6 +804,7 @@ class WhatsAppCustomerViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class WhatsAppOrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.WhatsAppOrder.objects.prefetch_related("lines").order_by("-created_at")
     serializer_class = serializers.WhatsAppOrderSerializer
+    required_feature = "whatsapp"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -727,6 +838,7 @@ class WhatsAppOrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class WhatsAppConfigViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.WhatsAppConfig.objects.all()
     serializer_class = serializers.WhatsAppConfigSerializer
+    required_feature = "whatsapp"
 
     def list(self, request, *args, **kwargs):
         tenant_id = self._resolve_tenant_id()
