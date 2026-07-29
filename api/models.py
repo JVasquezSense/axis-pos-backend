@@ -21,7 +21,7 @@ NAV_FEATURES = [
 ]
 
 # Capacidades que no son secciones del menú lateral.
-CAPABILITY_FEATURES = ["qr", "whatsapp", "ai"]
+CAPABILITY_FEATURES = ["qr", "whatsapp", "ai", "voice"]
 
 # Núcleo mínimo: sin esto no se puede operar el restaurante.
 CORE_FEATURES = ["dashboard", "salon", "orders", "kitchen", "checkout"]
