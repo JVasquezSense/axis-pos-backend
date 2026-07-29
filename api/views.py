@@ -337,10 +337,25 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
         solo en `consume_order_inventory`.
 
         Body: { reference: "mostrador", lines: [{ productId, quantity }] }
+               { orderCode: "OC-XXXX" }  → descuenta esa orden (idempotente)
+
+        Con `orderCode` (pedido para llevar que se paga por adelantado) se usa el
+        mismo consumo que el KDS y se marca la orden, para que al marcarla lista
+        en cocina no se descuente dos veces.
         """
         tenant_id = resolve_tenant_id(request.user)
         if not tenant_id:
             return response.Response({"error": "Restaurante no resuelto"}, status=status.HTTP_403_FORBIDDEN)
+
+        order_code = request.data.get("orderCode")
+        if order_code:
+            order = models.Order.objects.filter(tenant_id=tenant_id, code=order_code).first()
+            if order is None:
+                return response.Response({"error": "Pedido no encontrado"}, status=status.HTTP_404_NOT_FOUND)
+            with transaction.atomic():
+                consume_order_inventory(order)
+            return response.Response({"items": [], "movements": [], "consumed": True})
+
         lines = request.data.get("lines") or []
         if not isinstance(lines, list) or not lines:
             return response.Response({"error": "lines requerido"}, status=status.HTTP_400_BAD_REQUEST)
