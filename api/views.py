@@ -67,40 +67,41 @@ def expand_products(pairs):
     return demand
 
 
-def consume_order_inventory(order):
+def broadcast_inventory(tenant_id, items, movements):
     """
-    Descuenta del inventario los insumos consumidos por una orden, cruzando
-    cada OrderLine con la receta vinculada al producto (Recipe.product) y su
-    lista de ingredientes (RecipeIngredient). Genera InventoryMovement de tipo
-    "salida" y actualiza el stock + status de cada insumo afectado.
-
-    Es IDEMPOTENTE: solo descuenta si order.stock_consumed es False, y marca
-    el flag al terminar. Así, aunque la orden pase varias veces por
-    "preparing"/"ready", el stock se descuenta una única vez.
-
-    Regla de negocio (backlog #5): el inventario se descuenta cuando la cocina
-    prepara el pedido, NUNCA al cobrar.
+    Empuja al frontend los insumos y movimientos que acaban de cambiar, para que
+    el inventario y el kardex se actualicen sin recargar la página.
     """
-    if order.stock_consumed:
+    if not items and not movements:
         return
-    lines = list(order.lines.select_related("product").all())
-    if not lines:
-        order.stock_consumed = True
-        order.save(update_fields=["stock_consumed"])
-        return
+    try:
+        layer = get_channel_layer()
+        async_to_sync(layer.group_send)(
+            f"kitchen_{tenant_id}",
+            {
+                "type": "inventory.update",
+                "items": serializers.InventoryItemSerializer(items, many=True).data,
+                "movements": serializers.InventoryMovementSerializer(movements, many=True).data,
+            },
+        )
+    except Exception:
+        pass
 
-    # Un combo no tiene receta propia: se expande en sus componentes para que
-    # descuenten el inventario de cada uno.
-    demand = expand_products(((ln.product, ln.quantity) for ln in lines))
 
-    # Receta por producto (un producto -> su ficha técnica). 1:1 esperado.
+def consume_recipe_demand(tenant, demand, reason):
+    """
+    Descuenta del inventario los insumos que exige `demand` ({product_id: cantidad}),
+    cruzando cada producto con su receta. Devuelve (items_afectados, movimientos).
+
+    Es el núcleo compartido por el consumo del KDS y el de una venta directa de
+    caja (que nunca pasa por cocina).
+    """
     recipes = {
         r.product_id: r
         for r in models.Recipe.objects.filter(product_id__in=demand.keys()).prefetch_related("ingredients")
         if r.product_id is not None
     }
 
-    # Acumula consumo total por insumo (sumando todas las líneas de la orden).
     consumption = {}  # {inventory_item_id: cantidad_total}
     for product_id, qty in demand.items():
         recipe = recipes.get(product_id)
@@ -116,34 +117,68 @@ def consume_order_inventory(order):
             consumption[ing.item_id] = consumption.get(ing.item_id, 0) + consumed
 
     if not consumption:
-        order.stock_consumed = True
-        order.save(update_fields=["stock_consumed"])
-        return
+        return [], []
 
     items = {it.id: it for it in models.InventoryItem.objects.filter(id__in=consumption.keys())}
+    touched, movements = [], []
     for item_id, consumed in consumption.items():
         item = items.get(item_id)
         if not item:
             continue
-        new_stock = max(float(item.stock) - consumed, 0)
-        item.stock = new_stock
+        item.stock = max(float(item.stock) - consumed, 0)
         item.recompute_status()
         item.save(update_fields=["stock", "status", "updated_at"])
-        models.InventoryMovement.objects.create(
-            tenant=order.tenant,
+        movements.append(models.InventoryMovement.objects.create(
+            tenant=tenant,
             item=item,
             type="salida",
             quantity=-consumed,
             balance=item.stock,
             unit_cost=item.cost,
-            reason=f"Venta · Orden {order.code}",
-        )
-
-    order.stock_consumed = True
-    order.save(update_fields=["stock_consumed"])
+            reason=reason,
+        ))
+        touched.append(item)
 
     # Marca "Agotado" los productos que ya no alcanzan a prepararse.
     sync_products_availability(list(consumption.keys()))
+    return touched, movements
+
+
+def consume_order_inventory(order):
+    """
+    Descuenta del inventario los insumos consumidos por una orden, cruzando
+    cada OrderLine con la receta vinculada al producto (Recipe.product) y su
+    lista de ingredientes (RecipeIngredient). Genera InventoryMovement de tipo
+    "salida" y actualiza el stock + status de cada insumo afectado.
+
+    Es IDEMPOTENTE: solo descuenta si order.stock_consumed es False, y marca
+    el flag al terminar. Así, aunque la orden pase varias veces por
+    "preparing"/"ready", el stock se descuenta una única vez.
+
+    Regla de negocio (backlog #5): el inventario se descuenta cuando la cocina
+    prepara el pedido, NUNCA al cobrar.
+    """
+    # Candado de fila: "preparing" y "ready" pueden llegar casi a la vez desde
+    # dos pantallas y duplicar los movimientos del kardex.
+    locked = models.Order.objects.select_for_update().filter(pk=order.pk).first()
+    if locked is None or locked.stock_consumed:
+        return
+    order = locked
+    lines = list(order.lines.select_related("product").all())
+    if not lines:
+        order.stock_consumed = True
+        order.save(update_fields=["stock_consumed"])
+        return
+
+    # Un combo no tiene receta propia: se expande en sus componentes para que
+    # descuenten el inventario de cada uno.
+    demand = expand_products(((ln.product, ln.quantity) for ln in lines))
+
+    items, movements = consume_recipe_demand(order.tenant, demand, f"Venta · Orden {order.code}")
+
+    order.stock_consumed = True
+    order.save(update_fields=["stock_consumed"])
+    broadcast_inventory(order.tenant_id, items, movements)
 
 
 def sync_products_availability(item_ids):
@@ -294,6 +329,49 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
             else models.InventoryMovement.objects.none()
         return response.Response(serializers.InventoryMovementSerializer(qs, many=True).data)
 
+    @decorators.action(detail=False, methods=["post"])
+    def consume(self, request):
+        """
+        POST /api/v1/inventory/consume/ — descuenta insumos por una venta que
+        NO pasa por cocina (venta directa de caja). El pedido con KDS descuenta
+        solo en `consume_order_inventory`.
+
+        Body: { reference: "mostrador", lines: [{ productId, quantity }] }
+        """
+        tenant_id = resolve_tenant_id(request.user)
+        if not tenant_id:
+            return response.Response({"error": "Restaurante no resuelto"}, status=status.HTTP_403_FORBIDDEN)
+        lines = request.data.get("lines") or []
+        if not isinstance(lines, list) or not lines:
+            return response.Response({"error": "lines requerido"}, status=status.HTTP_400_BAD_REQUEST)
+
+        products = {
+            p.id: p for p in models.Product.objects.filter(
+                tenant_id=tenant_id, id__in=[ln.get("productId") for ln in lines if ln.get("productId")]
+            ).prefetch_related("combo_items__product")
+        }
+        pairs = []
+        for ln in lines:
+            product = products.get(ln.get("productId"))
+            try:
+                qty = float(ln.get("quantity") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if product is not None and qty > 0:
+                pairs.append((product, qty))
+        if not pairs:
+            return response.Response({"items": [], "movements": []})
+
+        reference = str(request.data.get("reference") or "mostrador")[:120]
+        tenant = models.Tenant.objects.get(pk=tenant_id)
+        with transaction.atomic():
+            items, movements = consume_recipe_demand(tenant, expand_products(pairs), f"Venta · {reference}")
+        broadcast_inventory(tenant_id, items, movements)
+        return response.Response({
+            "items": serializers.InventoryItemSerializer(items, many=True).data,
+            "movements": serializers.InventoryMovementSerializer(movements, many=True).data,
+        })
+
     @decorators.action(detail=True, methods=["post"])
     def adjust(self, request, pk=None):
         """Ajuste manual de stock desde el frontend (post-venta)."""
@@ -307,7 +385,7 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
         item.recompute_status()
         item.save()
         delta = float(new_stock) - old_stock
-        models.InventoryMovement.objects.create(
+        movement = models.InventoryMovement.objects.create(
             tenant=item.tenant,
             item=item,
             type="salida" if delta < 0 else "ajuste",
@@ -318,6 +396,7 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
         )
         # Un ajuste de stock puede agotar o reactivar los productos que lo usan.
         sync_products_availability([item.id])
+        broadcast_inventory(item.tenant_id, [item], [movement])
         return response.Response(serializers.InventoryItemSerializer(item).data)
 
 

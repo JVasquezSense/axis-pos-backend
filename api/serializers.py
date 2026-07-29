@@ -148,7 +148,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         item = models.InventoryItem.objects.create(**validated_data)
         item.recompute_status()
         item.save(update_fields=["status"])
-        models.InventoryMovement.objects.create(
+        movement = models.InventoryMovement.objects.create(
             tenant=item.tenant,
             item=item,
             type="inicial",
@@ -157,6 +157,8 @@ class InventoryItemSerializer(serializers.ModelSerializer):
             unit_cost=item.cost,
             reason=f"Saldo inicial · {item.name}",
         )
+        from .views import broadcast_inventory
+        broadcast_inventory(item.tenant_id, [item], [movement])
         return item
 
 
@@ -365,6 +367,7 @@ class PurchaseSerializer(serializers.ModelSerializer):
         lines_data = validated_data.pop("lines", [])
         purchase = models.Purchase.objects.create(**validated_data)
         affected_item_ids = []
+        touched, movements = [], []
         for line_data in lines_data:
             inv_item = line_data.pop("inventory_item")
             pl = models.PurchaseLine.objects.create(
@@ -375,7 +378,7 @@ class PurchaseSerializer(serializers.ModelSerializer):
             inv_item.recompute_status()
             inv_item.save()
             affected_item_ids.append(inv_item.id)
-            models.InventoryMovement.objects.create(
+            movements.append(models.InventoryMovement.objects.create(
                 tenant=purchase.tenant,
                 item=inv_item,
                 type="entrada",
@@ -383,10 +386,12 @@ class PurchaseSerializer(serializers.ModelSerializer):
                 balance=inv_item.stock,
                 unit_cost=pl.unit_cost,
                 reason=f"Compra {purchase.code} · {purchase.supplier.name}",
-            )
+            ))
+            touched.append(inv_item)
         # Una compra sube stock: puede reactivar productos que estaban "Agotado".
-        from .views import sync_products_availability
+        from .views import sync_products_availability, broadcast_inventory
         sync_products_availability(affected_item_ids)
+        broadcast_inventory(purchase.tenant_id, touched, movements)
         return purchase
 
 
@@ -701,6 +706,7 @@ def _restock_product(product, quantity, note, tenant):
     portions = max(recipe.portions, 1)
     reintegrated = False
     affected_item_ids = []
+    touched, movements = [], []
     for ing in recipe.ingredients.all():
         if ing.item_id is None:
             continue
@@ -711,7 +717,7 @@ def _restock_product(product, quantity, note, tenant):
         item.recompute_status()
         item.save(update_fields=["stock", "status", "updated_at"])
         affected_item_ids.append(item.id)
-        models.InventoryMovement.objects.create(
+        movements.append(models.InventoryMovement.objects.create(
             tenant=tenant,
             item=item,
             type="entrada",
@@ -719,10 +725,12 @@ def _restock_product(product, quantity, note, tenant):
             balance=item.stock,
             unit_cost=item.cost,
             reason=f"Devolución · {note.code}",
-        )
+        ))
+        touched.append(item)
         reintegrated = True
     # El reintegro sube stock: puede reactivar productos "Agotado".
     if affected_item_ids:
-        from .views import sync_products_availability
+        from .views import sync_products_availability, broadcast_inventory
         sync_products_availability(affected_item_ids)
+        broadcast_inventory(tenant.id, touched, movements)
     return reintegrated

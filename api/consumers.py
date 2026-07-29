@@ -30,6 +30,14 @@ class KitchenConsumer(AsyncWebsocketConsumer):
     async def ticket_update(self, event):
         await self.send(text_data=json.dumps({"event": "ticket.update", "payload": event["payload"]}))
 
+    async def inventory_update(self, event):
+        # Insumos y movimientos de kardex recién cambiados (stock en vivo).
+        await self.send(text_data=json.dumps({
+            "event": "inventory.update",
+            "items": event["items"],
+            "movements": event["movements"],
+        }))
+
     async def product_availability(self, event):
         # Cambios de disponibilidad ("Agotado") en vivo para menú/pedidos.
         await self.send(text_data=json.dumps({"event": "product.availability", "products": event["products"]}))
