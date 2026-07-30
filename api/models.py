@@ -330,6 +330,17 @@ class Purchase(TenantScoped):
     tax_total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     invoice_photo = models.TextField(blank=True)  # base64 data URL
+    # Datos de la factura del proveedor: sin ellos no se puede conciliar la
+    # compra con la contabilidad ni saber qué se debe y cuándo.
+    invoice_number = models.CharField(max_length=40, blank=True)
+    received_at = models.DateField(null=True, blank=True)   # recibo de mercancía
+    due_date = models.DateField(null=True, blank=True)      # vencimiento de la factura
+
+    @property
+    def is_overdue(self):
+        """La factura ya pasó su fecha de vencimiento."""
+        from django.utils import timezone
+        return bool(self.due_date and self.due_date < timezone.localdate())
 
     def __str__(self):
         return self.code

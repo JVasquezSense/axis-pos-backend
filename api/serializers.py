@@ -357,11 +357,16 @@ class PurchaseSerializer(serializers.ModelSerializer):
     supplierName = serializers.CharField(source="supplier.name", read_only=True)
     invoicePhoto = serializers.CharField(source="invoice_photo", required=False, allow_blank=True, default="")
     taxTotal = serializers.DecimalField(source="tax_total", max_digits=14, decimal_places=2, required=False, default=0)
+    invoiceNumber = serializers.CharField(source="invoice_number", required=False, allow_blank=True, default="")
+    receivedAt = serializers.DateField(source="received_at", required=False, allow_null=True)
+    dueDate = serializers.DateField(source="due_date", required=False, allow_null=True)
+    isOverdue = serializers.BooleanField(source="is_overdue", read_only=True)
 
     class Meta:
         model = models.Purchase
-        fields = ["id", "code", "supplierId", "supplierName", "date", "subtotal", "taxTotal", "total", "lines", "invoicePhoto"]
-        read_only_fields = ["date", "supplierName"]
+        fields = ["id", "code", "supplierId", "supplierName", "date", "subtotal", "taxTotal", "total",
+                  "lines", "invoicePhoto", "invoiceNumber", "receivedAt", "dueDate", "isOverdue"]
+        read_only_fields = ["date", "supplierName", "isOverdue"]
 
     def create(self, validated_data):
         lines_data = validated_data.pop("lines", [])
