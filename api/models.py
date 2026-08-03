@@ -157,6 +157,11 @@ class Product(TenantScoped):
     # (ver ComboItem). Modelarlo así deja intacto todo lo que ya consume
     # Product: pedidos, KDS, ventas, carta pública y reportes.
     is_combo = models.BooleanField(default=False)
+    # Impuestos del producto: [{"name": "IVA", "type": "percent", "rate": 19},
+    # {"name": "Ipoconsumo", "type": "fixed", "rate": 400}]. Una cerveza puede
+    # llevar IVA porcentual y un impuesto fijo por unidad a la vez; vacío = usa
+    # el impuesto general del restaurante.
+    taxes = models.JSONField(default=list, blank=True)
 
     def components_total(self):
         """Suma del precio de los componentes (precio del combo si no lo es)."""

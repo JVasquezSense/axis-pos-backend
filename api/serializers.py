@@ -63,7 +63,7 @@ class ProductSerializer(serializers.ModelSerializer):
         model = models.Product
         fields = ["id", "name", "description", "price", "category", "image", "tags", "available",
                   "prepMinutes", "popular", "restockable", "isCombo", "comboItems", "componentsTotal",
-                  "variations"]
+                  "variations", "taxes"]
 
     def get_variations(self, obj):
         recipe = next(iter(obj.recipes.all()), None)
@@ -265,10 +265,16 @@ class OrderSerializer(serializers.ModelSerializer):
 
 class TableSerializer(serializers.ModelSerializer):
     seatedAt = serializers.DateTimeField(source="seated_at", read_only=True)
+    # Una mesa ocupada sin pedido activo queda bloqueada sin que nadie lo note.
+    hasActiveOrder = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Table
-        fields = ["id", "number", "capacity", "zone", "status", "waiter", "seatedAt", "x", "y", "shape"]
+        fields = ["id", "number", "capacity", "zone", "status", "waiter", "seatedAt",
+                  "hasActiveOrder", "x", "y", "shape"]
+
+    def get_hasActiveOrder(self, obj):
+        return obj.orders.filter(status__in=["pending", "preparing", "ready", "served"]).exists()
 
 
 class CustomerSerializer(serializers.ModelSerializer):

@@ -419,6 +419,22 @@ class TableViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Table.objects.all()
     serializer_class = serializers.TableSerializer
 
+    def perform_update(self, serializer):
+        """
+        La hora de ocupación la lleva el servidor, no el cliente: si solo vive en
+        el navegador, al recargar la mesa aparece ocupada pero sin tiempo de espera.
+        """
+        previous = self.get_object().status
+        table = serializer.save()
+        status_now = table.status
+        if status_now != previous:
+            if status_now in ("occupied", "billing") and table.seated_at is None:
+                table.seated_at = timezone.now()
+                table.save(update_fields=["seated_at"])
+            elif status_now == "available" and table.seated_at is not None:
+                table.seated_at = None
+                table.save(update_fields=["seated_at"])
+
 
 class RecipeViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Recipe.objects.prefetch_related("ingredients")
