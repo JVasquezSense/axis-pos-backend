@@ -67,6 +67,45 @@ def expand_products(pairs):
     return demand
 
 
+ACTIVE_ORDER_STATUSES = ("pending", "preparing", "ready", "served")
+
+
+def sync_table_status(table):
+    """
+    Deja el estado de la mesa acorde a sus pedidos: ocupada mientras tenga alguno
+    activo (venga del mesero o del QR), libre cuando no queda ninguno.
+
+    El pedido web asociaba la mesa pero no la ocupaba: en el salón seguía
+    apareciendo libre y nadie sabía que había que cobrarla.
+    """
+    if table is None:
+        return
+    has_active = models.Order.objects.filter(
+        table=table, status__in=ACTIVE_ORDER_STATUSES
+    ).exists()
+
+    if has_active and table.status == "available":
+        table.status = "occupied"
+        table.seated_at = table.seated_at or timezone.now()
+        table.save(update_fields=["status", "seated_at"])
+    elif not has_active and table.status in ("occupied", "billing"):
+        table.status = "available"
+        table.seated_at = None
+        table.save(update_fields=["status", "seated_at"])
+    else:
+        return
+
+    # El salón y la caja se enteran sin recargar.
+    try:
+        layer = get_channel_layer()
+        async_to_sync(layer.group_send)(
+            f"kitchen_{table.tenant_id}",
+            {"type": "table.update", "table": serializers.TableSerializer(table).data},
+        )
+    except Exception:
+        pass
+
+
 def broadcast_inventory(tenant_id, items, movements):
     """
     Empuja al frontend los insumos y movimientos que acaban de cambiar, para que
@@ -470,6 +509,7 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         tenant_id = self._resolve_tenant_id()
         order = serializer.save(tenant_id=tenant_id) if tenant_id else serializer.save()
+        sync_table_status(order.table)
         # Empuja ticket a cocina vía WebSocket
         try:
             layer = get_channel_layer()
@@ -492,6 +532,9 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
                     consume_order_inventory(order)
             except Exception:
                 pass
+        # Cobrar o cancelar el último pedido de la mesa la deja libre sola.
+        sync_table_status(order.table)
+
         # Avisa cambios de estado (ej. preparando/listo) a otras pantallas conectadas
         try:
             layer = get_channel_layer()
@@ -1480,6 +1523,9 @@ class PublicOrderView(drf_views.APIView):
                     summary=f"+{created_lines} producto(s) desde la carta web",
                     detail={"addedLines": created_lines},
                 )
+
+        # Ocupar la mesa es parte de tomar el pedido, no un detalle del POS.
+        sync_table_status(order.table)
 
         avg_wait = estimate_wait_minutes(tenant, order)
 
