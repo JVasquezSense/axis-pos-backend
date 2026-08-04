@@ -454,6 +454,31 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
         return response.Response(serializers.InventoryItemSerializer(item).data)
 
 
+class SalonZoneViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    """
+    Zonas del mapa del salón. `Table.zone` guarda el nombre, así que renombrar o
+    eliminar una zona tiene que arrastrar sus mesas: si no, quedan apuntando a
+    una zona que ya no existe y desaparecen del mapa.
+    """
+    queryset = models.SalonZone.objects.all()
+    serializer_class = serializers.SalonZoneSerializer
+
+    def perform_update(self, serializer):
+        previous = self.get_object().name
+        zone = serializer.save()
+        if zone.name != previous:
+            models.Table.objects.filter(tenant=zone.tenant, zone=previous).update(zone=zone.name)
+
+    def perform_destroy(self, instance):
+        tenant = instance.tenant
+        name = instance.name
+        super().perform_destroy(instance)
+        # Las mesas de la zona borrada se mudan a la primera zona que quede.
+        fallback = models.SalonZone.objects.filter(tenant=tenant).order_by("y_start").first()
+        if fallback:
+            models.Table.objects.filter(tenant=tenant, zone=name).update(zone=fallback.name)
+
+
 class TableViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Table.objects.all()
     serializer_class = serializers.TableSerializer

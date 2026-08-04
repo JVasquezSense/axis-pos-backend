@@ -263,6 +263,14 @@ class OrderSerializer(serializers.ModelSerializer):
         return instance
 
 
+class SalonZoneSerializer(serializers.ModelSerializer):
+    yStart = serializers.FloatField(source="y_start")
+
+    class Meta:
+        model = models.SalonZone
+        fields = ["id", "name", "yStart", "height"]
+
+
 class TableSerializer(serializers.ModelSerializer):
     seatedAt = serializers.DateTimeField(source="seated_at", read_only=True)
     # Una mesa ocupada sin pedido activo queda bloqueada sin que nadie lo note.

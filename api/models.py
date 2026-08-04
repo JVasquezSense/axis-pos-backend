@@ -251,6 +251,22 @@ class RecipeIngredient(models.Model):
     waste = models.FloatField(default=0)  # 0..1
 
 
+class SalonZone(TenantScoped):
+    """
+    Franja del mapa del salón (Terraza, Barra…). Vivía solo en el navegador, así
+    que renombrarla o crearla se perdía al recargar.
+    """
+    name = models.CharField(max_length=60)
+    y_start = models.FloatField(default=0)   # % desde arriba del lienzo
+    height = models.FloatField(default=30)   # alto en % del lienzo
+
+    class Meta:
+        ordering = ["y_start"]
+
+    def __str__(self):
+        return self.name
+
+
 class Table(TenantScoped):
     STATUS = [("available", "Disponible"), ("occupied", "Ocupada"), ("reserved", "Reservada"), ("billing", "Cuenta")]
     SHAPE = [("round", "Redonda"), ("square", "Cuadrada"), ("rect", "Rectangular")]
