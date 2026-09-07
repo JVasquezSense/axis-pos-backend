@@ -70,6 +70,21 @@ def expand_products(pairs):
 ACTIVE_ORDER_STATUSES = ("pending", "preparing", "ready", "served")
 
 
+def first_order_started_at(table):
+    """
+    Hora del pedido activo más antiguo de la mesa. El tiempo de espera que ve el
+    mesero debe contar desde que se sentó el cliente, no desde que alguien
+    reparó el estado de la mesa.
+    """
+    first = (
+        models.Order.objects.filter(table=table, status__in=ACTIVE_ORDER_STATUSES)
+        .order_by("created_at")
+        .values_list("created_at", flat=True)
+        .first()
+    )
+    return first
+
+
 def sync_table_status(table):
     """
     Deja el estado de la mesa acorde a sus pedidos: ocupada mientras tenga alguno
@@ -84,9 +99,9 @@ def sync_table_status(table):
         table=table, status__in=ACTIVE_ORDER_STATUSES
     ).exists()
 
-    if has_active and table.status == "available":
-        table.status = "occupied"
-        table.seated_at = table.seated_at or timezone.now()
+    if has_active and (table.status == "available" or table.seated_at is None):
+        table.status = "occupied" if table.status == "available" else table.status
+        table.seated_at = table.seated_at or first_order_started_at(table) or timezone.now()
         table.save(update_fields=["status", "seated_at"])
     elif not has_active and table.status in ("occupied", "billing"):
         table.status = "available"
@@ -127,6 +142,69 @@ def broadcast_inventory(tenant_id, items, movements):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Unidades de receta contra unidades de inventario
+# ---------------------------------------------------------------------------
+# La receta se escribe en la unidad natural de la cocina ("40 g de queso")
+# mientras el inventario lleva ese insumo en otra ("kg"). Restar la cantidad
+# cruda dejaba salidas de 40 kg donde iban 40 g: en el kardex aparecían salidas
+# mil veces mayores que la venta.
+
+_MASS = {"g": 1.0, "gr": 1.0, "gramo": 1.0, "gramos": 1.0,
+         "kg": 1000.0, "kilo": 1000.0, "kilos": 1000.0,
+         "lb": 453.592, "libra": 453.592, "oz": 28.3495}
+_VOLUME = {"ml": 1.0, "cc": 1.0, "cl": 10.0, "l": 1000.0, "lt": 1000.0,
+           "litro": 1000.0, "litros": 1000.0}
+# Unidades de conteo: una botella no se merma en fracciones.
+_COUNT = {"und", "un", "u", "uni", "unid", "unidad", "unidades", "pieza",
+          "piezas", "pza", "pz", "botella", "botellas", "lata", "latas",
+          "bolsa", "bolsas", "paquete", "paquetes", "caja", "cajas", "porcion"}
+
+
+def _norm_unit(unit):
+    return (unit or "").strip().lower()
+
+
+def is_count_unit(unit):
+    return _norm_unit(unit) in _COUNT
+
+
+def unit_factor(from_unit, to_unit):
+    """
+    Cuántas `to_unit` equivale 1 `from_unit`. Devuelve None cuando no hay
+    equivalencia honesta (masa contra volumen, o dos unidades de conteo
+    distintas): ahí se respeta la unidad del inventario en lugar de inventar
+    un factor.
+    """
+    fu, tu = _norm_unit(from_unit), _norm_unit(to_unit)
+    if not fu or not tu or fu == tu:
+        return 1.0
+    for table in (_MASS, _VOLUME):
+        if fu in table and tu in table:
+            return table[fu] / table[tu]
+    return None
+
+
+def ingredient_consumption(ing, item):
+    """
+    Cantidad del insumo que consume una porción del ingrediente, ya en la unidad
+    del inventario y con la merma incluida.
+    """
+    quantity = float(ing.quantity)
+    # La merma es desperdicio de producto a granel; sobre unidades enteras
+    # (una gaseosa, una botella) solo ensuciaba el kardex con 1.05 unidades.
+    #
+    # Se despacha `cantidad / (1 - merma)`, no `cantidad * (1 + merma)`: la merma
+    # es el porcentaje que se pierde de lo que sale de la nevera, que es como la
+    # calcula el costeo de la ficha técnica. Con las dos fórmulas conviviendo, la
+    # receta costeaba una cantidad y el kardex descontaba otra.
+    if not is_count_unit(item.unit):
+        waste = min(max(float(ing.waste or 0), 0.0), 0.95)
+        quantity /= 1.0 - waste
+    factor = unit_factor(ing.unit, item.unit)
+    return quantity * (factor if factor is not None else 1.0)
+
+
 def consume_recipe_demand(tenant, demand, reason):
     """
     Descuenta del inventario los insumos que exige `demand` ({product_id: cantidad}),
@@ -141,18 +219,27 @@ def consume_recipe_demand(tenant, demand, reason):
         if r.product_id is not None
     }
 
-    consumption = {}  # {inventory_item_id: cantidad_total}
+    consumption = {}  # {inventory_item_id: cantidad_total en la unidad del insumo}
+    ingredient_ids = set()
+    for recipe in recipes.values():
+        for ing in recipe.ingredients.all():
+            if ing.item_id is not None:
+                ingredient_ids.add(ing.item_id)
+    # Los insumos se necesitan ANTES de calcular: la conversión depende de la
+    # unidad en la que el restaurante lleva cada uno.
+    units = {it.id: it for it in models.InventoryItem.objects.filter(id__in=ingredient_ids)}
+
     for product_id, qty in demand.items():
         recipe = recipes.get(product_id)
         if not recipe:
             continue
         portions = max(recipe.portions, 1)
         for ing in recipe.ingredients.all():
-            if ing.item_id is None:
+            item = units.get(ing.item_id)
+            if item is None:
                 continue
-            # Cantidad por porción ya considerando el desperdicio (waste 0..1).
-            effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
-            consumed = (effective / portions) * float(qty)
+            per_portion = ingredient_consumption(ing, item) / portions
+            consumed = per_portion * float(qty)
             consumption[ing.item_id] = consumption.get(ing.item_id, 0) + consumed
 
     if not consumption:
@@ -230,7 +317,8 @@ def sync_products_availability(item_ids):
 
     Solo afecta productos con receta e insumos vinculados; los productos sin
     receta conservan su disponibilidad manual. Usa la misma fórmula de consumo
-    que consume_order_inventory (cantidad × (1+merma) / porciones).
+    que consume_order_inventory (cantidad × (1+merma) / porciones, convertida
+    a la unidad del insumo).
     """
     item_ids = [i for i in item_ids if i]
     if not item_ids:
@@ -251,7 +339,7 @@ def sync_products_availability(item_ids):
         for ing in recipe.ingredients.all():
             if ing.item_id is None or ing.item is None:
                 continue
-            per_portion = (float(ing.quantity) * (1.0 + float(ing.waste or 0))) / portions
+            per_portion = ingredient_consumption(ing, ing.item) / portions
             if per_portion <= 0:
                 continue
             feasible = int(float(ing.item.stock) // per_portion)
@@ -487,17 +575,19 @@ class TableViewSet(TenantQuerySet, viewsets.ModelViewSet):
         """
         La hora de ocupación la lleva el servidor, no el cliente: si solo vive en
         el navegador, al recargar la mesa aparece ocupada pero sin tiempo de espera.
+
+        Se mira el estado resultante, no el cambio de estado: la mesa se marcaba
+        ocupada por varios caminos (mesero, QR, unir mesas) y con el segundo
+        PATCH ya no había transición, así que se quedaba ocupada para siempre sin
+        hora de sentada. Por eso el tiempo de espera solo aparecía en una mesa.
         """
-        previous = self.get_object().status
         table = serializer.save()
-        status_now = table.status
-        if status_now != previous:
-            if status_now in ("occupied", "billing") and table.seated_at is None:
-                table.seated_at = timezone.now()
-                table.save(update_fields=["seated_at"])
-            elif status_now == "available" and table.seated_at is not None:
-                table.seated_at = None
-                table.save(update_fields=["seated_at"])
+        if table.status in ("occupied", "billing") and table.seated_at is None:
+            table.seated_at = first_order_started_at(table) or timezone.now()
+            table.save(update_fields=["seated_at"])
+        elif table.status == "available" and table.seated_at is not None:
+            table.seated_at = None
+            table.save(update_fields=["seated_at"])
 
 
 class RecipeViewSet(TenantQuerySet, viewsets.ModelViewSet):
