@@ -74,6 +74,18 @@ class ProductSerializer(serializers.ModelSerializer):
                   "prepMinutes", "popular", "restockable", "isCombo", "comboItems", "componentsTotal",
                   "variations", "taxes", "cost", "inventoryId", "inventoryQty"]
 
+    def validate_variations(self, value):
+        """
+        Las variaciones heredadas de la ficha técnica no se copian al producto.
+
+        El POS necesita verlas para poder elegirlas al pedir, así que se
+        exponen en el producto; si al guardar se escribieran como propias, la
+        receta dejaría de mandar sobre ellas sin que nadie lo pidiera.
+        """
+        if not isinstance(value, list):
+            return []
+        return [v for v in value if isinstance(v, dict) and not v.get("inherited")]
+
     def validate(self, attrs):
         """El insumo vinculado tiene que ser del mismo restaurante."""
         item = attrs.get("inventory_item")
@@ -96,9 +108,11 @@ class ProductSerializer(serializers.ModelSerializer):
         la ficha técnica, que es donde vivían hasta ahora.
         """
         source = obj.variations or []
+        inherited = False
         if not source:
             recipe = next(iter(obj.recipes.all()), None)
             source = (recipe.variations or []) if recipe is not None else []
+            inherited = bool(source)
         out = []
         for i, v in enumerate(source):
             if not isinstance(v, dict):
@@ -109,6 +123,7 @@ class ProductSerializer(serializers.ModelSerializer):
             out.append({
                 "id": str(v.get("id") or f"var-{i}"),
                 "name": name,
+                "inherited": inherited,
                 "priceDelta": float(v.get("priceDelta") or 0),
             })
         return out
