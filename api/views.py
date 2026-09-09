@@ -218,6 +218,13 @@ def consume_recipe_demand(tenant, demand, reason):
         for r in models.Recipe.objects.filter(product_id__in=demand.keys()).prefetch_related("ingredients")
         if r.product_id is not None
     }
+    # Productos que SON un insumo (una cerveza, una cajetilla): se venden sin
+    # ficha técnica y aun así tienen que mover el kardex.
+    direct = {
+        p.id: p
+        for p in models.Product.objects.filter(id__in=demand.keys(), inventory_item__isnull=False)
+        if p.id not in recipes
+    }
 
     consumption = {}  # {inventory_item_id: cantidad_total en la unidad del insumo}
     ingredient_ids = set()
@@ -225,11 +232,18 @@ def consume_recipe_demand(tenant, demand, reason):
         for ing in recipe.ingredients.all():
             if ing.item_id is not None:
                 ingredient_ids.add(ing.item_id)
+    ingredient_ids.update(p.inventory_item_id for p in direct.values())
     # Los insumos se necesitan ANTES de calcular: la conversión depende de la
     # unidad en la que el restaurante lleva cada uno.
     units = {it.id: it for it in models.InventoryItem.objects.filter(id__in=ingredient_ids)}
 
     for product_id, qty in demand.items():
+        product = direct.get(product_id)
+        if product is not None:
+            consumed = float(product.inventory_qty or 1) * float(qty)
+            key = product.inventory_item_id
+            consumption[key] = consumption.get(key, 0) + consumed
+            continue
         recipe = recipes.get(product_id)
         if not recipe:
             continue
@@ -332,6 +346,17 @@ def sync_products_availability(item_ids):
     )
     changed = []       # [{"id": str, "available": bool}] para el push en vivo
     tenant_id = None
+
+    # Productos vendidos directamente como insumo: agotado = sin stock.
+    for product in models.Product.objects.filter(inventory_item_id__in=item_ids).select_related("inventory_item"):
+        need = float(product.inventory_qty or 1)
+        available = need <= 0 or float(product.inventory_item.stock) >= need
+        if product.available != available:
+            product.available = available
+            product.save(update_fields=["available"])
+            changed.append({"id": str(product.id), "available": available})
+            tenant_id = product.tenant_id
+
     for recipe in recipes:
         product = recipe.product
         portions = max(recipe.portions, 1)
@@ -593,7 +618,9 @@ class TableViewSet(TenantQuerySet, viewsets.ModelViewSet):
 class RecipeViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Recipe.objects.prefetch_related("ingredients")
     serializer_class = serializers.RecipeSerializer
-    required_feature = "menu"
+    # Las fichas técnicas son su propia capacidad: el plan Mini tiene carta e
+    # inventario pero no recetas, y el producto lleva su costo de producción.
+    required_feature = "recipes"
 
 
 class CustomerViewSet(TenantQuerySet, viewsets.ModelViewSet):

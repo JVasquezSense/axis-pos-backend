@@ -21,22 +21,32 @@ NAV_FEATURES = [
 ]
 
 # Capacidades que no son secciones del menú lateral.
-CAPABILITY_FEATURES = ["qr", "whatsapp", "ai", "voice"]
+CAPABILITY_FEATURES = ["qr", "whatsapp", "ai", "voice", "recipes"]
 
 # Núcleo mínimo: sin esto no se puede operar el restaurante.
 CORE_FEATURES = ["dashboard", "salon", "orders", "kitchen", "checkout"]
+
+# Plan Mini: lo justo para vender. Sin fichas técnicas — los productos llevan su
+# costo de producción y, si descuentan inventario, apuntan directo al insumo.
+MINI_FEATURES = {
+    "shift": True, "menu": True, "employees": True, "inventory": True,
+    "ai": True, "recipes": False,
+}
 
 
 def _default_features():
     """Base del plan más chico: solo el núcleo operativo."""
     feats = {k: (k in CORE_FEATURES) for k in NAV_FEATURES}
     feats.update({k: False for k in CAPABILITY_FEATURES})
+    # Las fichas técnicas son el modo normal del producto; solo el plan Mini las
+    # apaga, y ahí el producto lleva su costo de producción directo.
+    feats["recipes"] = True
     feats["max_users"] = 2
     return feats
 
 
 class Tenant(models.Model):
-    PLAN = [("starter", "Starter"), ("growth", "Growth"), ("enterprise", "Enterprise")]
+    PLAN = [("mini", "Mini"), ("starter", "Starter"), ("growth", "Growth"), ("enterprise", "Enterprise")]
     STATUS = [("active", "Activo"), ("trial", "Prueba"), ("past_due", "Mora"), ("churned", "Cancelado")]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -102,7 +112,7 @@ class Tenant(models.Model):
 
 class Plan(models.Model):
     """Plantilla de features por plan (configuración global del SaaS)."""
-    CODE = [("starter", "Básico"), ("growth", "Pro"), ("enterprise", "Enterprise")]
+    CODE = [("mini", "Axis Mini"), ("starter", "Básico"), ("growth", "Pro"), ("enterprise", "Enterprise")]
     code = models.CharField(max_length=20, choices=CODE, unique=True)
     name = models.CharField(max_length=60)
     max_users = models.PositiveIntegerField(default=2)
@@ -162,6 +172,24 @@ class Product(TenantScoped):
     # llevar IVA porcentual y un impuesto fijo por unidad a la vez; vacío = usa
     # el impuesto general del restaurante.
     taxes = models.JSONField(default=list, blank=True)
+    # Costo de producción del plato. En los restaurantes que trabajan sin ficha
+    # técnica (plan Mini) es el único costo que hay, y sin él no se puede saber
+    # el margen de nada.
+    cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    # Producto que ES un insumo del inventario: una cerveza, una cajetilla, una
+    # botella. Se vendían sin mover el kardex porque descontar exigía montarles
+    # una "receta" de un solo ingrediente, y nadie lo hacía.
+    inventory_item = models.ForeignKey(
+        "InventoryItem", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="sold_as_products",
+    )
+    # Cuántas unidades del insumo consume una venta del producto (un six-pack
+    # descuenta 6).
+    inventory_qty = models.DecimalField(max_digits=12, decimal_places=3, default=1)
+    # Variaciones propias del producto ("Doble", "Sin azúcar"). Antes solo
+    # existían dentro de la ficha técnica, así que un producto sin receta no
+    # podía tener ninguna.
+    variations = models.JSONField(default=list, blank=True)
 
     def components_total(self):
         """Suma del precio de los componentes (precio del combo si no lo es)."""

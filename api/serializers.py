@@ -51,7 +51,16 @@ class ProductSerializer(serializers.ModelSerializer):
     componentsTotal = serializers.SerializerMethodField()
     # Variaciones de la ficha técnica (ej. "Doble carne" +$8.000). Se exponen en
     # el producto para poder elegirlas al pedir, tanto en el POS como en la web.
-    variations = serializers.SerializerMethodField()
+    variations = serializers.JSONField(required=False)
+    # Insumo que este producto descuenta al venderse, para los productos que se
+    # venden tal cual (una cerveza, una cajetilla) y no tienen ficha técnica.
+    inventoryId = serializers.PrimaryKeyRelatedField(
+        source="inventory_item", queryset=models.InventoryItem.objects.all(),
+        required=False, allow_null=True,
+    )
+    inventoryQty = serializers.DecimalField(
+        source="inventory_qty", max_digits=12, decimal_places=3, required=False
+    )
     # Filtramos el queryset de categoría por el tenant del usuario autenticado.
     # Sin esto, DRF valida `category` contra TODAS las categorías (incluidas las
     # de otros restaurantes), lo que produce errores 400 confusos ("Clave
@@ -63,14 +72,35 @@ class ProductSerializer(serializers.ModelSerializer):
         model = models.Product
         fields = ["id", "name", "description", "price", "category", "image", "tags", "available",
                   "prepMinutes", "popular", "restockable", "isCombo", "comboItems", "componentsTotal",
-                  "variations", "taxes"]
+                  "variations", "taxes", "cost", "inventoryId", "inventoryQty"]
 
-    def get_variations(self, obj):
-        recipe = next(iter(obj.recipes.all()), None)
-        if recipe is None:
-            return []
+    def validate(self, attrs):
+        """El insumo vinculado tiene que ser del mismo restaurante."""
+        item = attrs.get("inventory_item")
+        if item is not None:
+            request = self.context.get("request")
+            from .views import resolve_tenant_id
+            tenant_id = resolve_tenant_id(getattr(request, "user", None)) if request else None
+            if tenant_id and item.tenant_id != tenant_id:
+                raise serializers.ValidationError({"inventoryId": "El insumo no es de este restaurante."})
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["variations"] = self._variations(instance)
+        return data
+
+    def _variations(self, obj):
+        """
+        Variaciones del producto. Las propias mandan; si no tiene, se heredan de
+        la ficha técnica, que es donde vivían hasta ahora.
+        """
+        source = obj.variations or []
+        if not source:
+            recipe = next(iter(obj.recipes.all()), None)
+            source = (recipe.variations or []) if recipe is not None else []
         out = []
-        for i, v in enumerate(recipe.variations or []):
+        for i, v in enumerate(source):
             if not isinstance(v, dict):
                 continue
             name = str(v.get("name") or "").strip()

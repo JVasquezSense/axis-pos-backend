@@ -26,6 +26,11 @@ CSRF_TRUSTED_ORIGINS = env.list(
     "CSRF_TRUSTED_ORIGINS",
     default=["https://*.railway.app"],
 )
+# Las facturas y logos viajan como data URL dentro del JSON. Con el limite por
+# defecto (2,5 MB) una foto de celular hacia fallar el registro de la compra
+# entera, sin mensaje que lo explicara.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 15 * 1024 * 1024
+
 # Detrás del proxy de Railway (TLS terminado en el borde)
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
