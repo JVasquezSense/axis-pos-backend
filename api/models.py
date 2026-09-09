@@ -151,6 +151,13 @@ class Category(TenantScoped):
 
 
 class Product(TenantScoped):
+    # Cómo consume inventario este producto:
+    #   simple   → ES un insumo y lo descuenta directo (una gaseosa, una cajetilla)
+    #   compound → se prepara, y descuenta los insumos de su ficha técnica
+    # Antes se deducía del hecho de tener receta o no, y un producto sin ficha
+    # quedaba en tierra de nadie: no descontaba nada y nadie sabía por qué.
+    KIND = [("simple", "Simple"), ("compound", "Requiere insumos")]
+
     name = models.CharField(max_length=120)
     description = models.TextField(blank=True)
     price = models.DecimalField(max_digits=12, decimal_places=2)
@@ -176,6 +183,7 @@ class Product(TenantScoped):
     # técnica (plan Mini) es el único costo que hay, y sin él no se puede saber
     # el margen de nada.
     cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    kind = models.CharField(max_length=10, choices=KIND, default="simple")
     # Producto que ES un insumo del inventario: una cerveza, una cajetilla, una
     # botella. Se vendían sin mover el kardex porque descontar exigía montarles
     # una "receta" de un solo ingrediente, y nadie lo hacía.

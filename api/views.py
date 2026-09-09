@@ -213,17 +213,20 @@ def consume_recipe_demand(tenant, demand, reason):
     Es el núcleo compartido por el consumo del KDS y el de una venta directa de
     caja (que nunca pasa por cocina).
     """
+    # Cada producto declara cómo consume: el simple descuenta el insumo que ES,
+    # el compuesto los de su ficha técnica. Deducirlo de "tiene receta o no"
+    # dejaba sin descontar a todo lo que se vende tal cual sin ficha.
+    simple = {
+        p.id: p
+        for p in models.Product.objects.filter(
+            id__in=demand.keys(), kind="simple", inventory_item__isnull=False
+        )
+    }
+    compound_ids = [pid for pid in demand if pid not in simple]
     recipes = {
         r.product_id: r
-        for r in models.Recipe.objects.filter(product_id__in=demand.keys()).prefetch_related("ingredients")
+        for r in models.Recipe.objects.filter(product_id__in=compound_ids).prefetch_related("ingredients")
         if r.product_id is not None
-    }
-    # Productos que SON un insumo (una cerveza, una cajetilla): se venden sin
-    # ficha técnica y aun así tienen que mover el kardex.
-    direct = {
-        p.id: p
-        for p in models.Product.objects.filter(id__in=demand.keys(), inventory_item__isnull=False)
-        if p.id not in recipes
     }
 
     consumption = {}  # {inventory_item_id: cantidad_total en la unidad del insumo}
@@ -232,13 +235,13 @@ def consume_recipe_demand(tenant, demand, reason):
         for ing in recipe.ingredients.all():
             if ing.item_id is not None:
                 ingredient_ids.add(ing.item_id)
-    ingredient_ids.update(p.inventory_item_id for p in direct.values())
+    ingredient_ids.update(p.inventory_item_id for p in simple.values())
     # Los insumos se necesitan ANTES de calcular: la conversión depende de la
     # unidad en la que el restaurante lleva cada uno.
     units = {it.id: it for it in models.InventoryItem.objects.filter(id__in=ingredient_ids)}
 
     for product_id, qty in demand.items():
-        product = direct.get(product_id)
+        product = simple.get(product_id)
         if product is not None:
             consumed = float(product.inventory_qty or 1) * float(qty)
             key = product.inventory_item_id
@@ -340,6 +343,9 @@ def sync_products_availability(item_ids):
     recipes = (
         models.Recipe.objects
         .filter(product__isnull=False, ingredients__item_id__in=item_ids)
+        # Un producto marcado como simple descuenta su propio insumo; su
+        # disponibilidad no la manda una receta que ya no usa.
+        .exclude(product__kind="simple")
         .distinct()
         .select_related("product")
         .prefetch_related("ingredients__item")
@@ -348,7 +354,9 @@ def sync_products_availability(item_ids):
     tenant_id = None
 
     # Productos vendidos directamente como insumo: agotado = sin stock.
-    for product in models.Product.objects.filter(inventory_item_id__in=item_ids).select_related("inventory_item"):
+    for product in models.Product.objects.filter(
+        inventory_item_id__in=item_ids, kind="simple"
+    ).select_related("inventory_item"):
         need = float(product.inventory_qty or 1)
         available = need <= 0 or float(product.inventory_item.stock) >= need
         if product.available != available:
@@ -1782,7 +1790,10 @@ class DishConsumptionView(drf_views.APIView):
             else:
                 product_ids.add(ln.product_id)
         recipe_map = {}
-        for r in models.Recipe.objects.filter(product_id__in=product_ids, tenant_id=tenant_id).prefetch_related("ingredients__item"):
+        for r in (models.Recipe.objects
+                  .filter(product_id__in=product_ids, tenant_id=tenant_id)
+                  .exclude(product__kind="simple")
+                  .prefetch_related("ingredients__item")):
             if r.product_id is not None and r.product_id not in recipe_map:
                 recipe_map[r.product_id] = (max(r.portions, 1), list(r.ingredients.all()))
 

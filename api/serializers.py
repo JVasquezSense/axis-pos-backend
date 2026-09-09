@@ -72,7 +72,7 @@ class ProductSerializer(serializers.ModelSerializer):
         model = models.Product
         fields = ["id", "name", "description", "price", "category", "image", "tags", "available",
                   "prepMinutes", "popular", "restockable", "isCombo", "comboItems", "componentsTotal",
-                  "variations", "taxes", "cost", "inventoryId", "inventoryQty"]
+                  "variations", "taxes", "cost", "kind", "inventoryId", "inventoryQty"]
 
     def validate_variations(self, value):
         """
