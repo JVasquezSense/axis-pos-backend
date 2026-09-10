@@ -208,6 +208,10 @@ class Product(TenantScoped):
     # el margen de nada.
     cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     kind = models.CharField(max_length=10, choices=KIND, default="simple")
+    # ¿Pasa por cocina? Una cerveza que se saca de la nevera no tiene nada que
+    # preparar, y obligarla a recorrer el KDS hacía que el mesero tuviera que ir
+    # a marcarla listo para poder entregarla.
+    needs_preparation = models.BooleanField(default=True)
     # Producto que ES un insumo del inventario: una cerveza, una cajetilla, una
     # botella. Se vendían sin mover el kardex porque descontar exigía montarles
     # una "receta" de un solo ingrediente, y nadie lo hacía.

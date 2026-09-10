@@ -69,6 +69,7 @@ class ProductSerializer(serializers.ModelSerializer):
     inventoryQty = serializers.DecimalField(
         source="inventory_qty", max_digits=12, decimal_places=3, required=False
     )
+    needsPreparation = serializers.BooleanField(source="needs_preparation", required=False)
     # Filtramos el queryset de categoría por el tenant del usuario autenticado.
     # Sin esto, DRF valida `category` contra TODAS las categorías (incluidas las
     # de otros restaurantes), lo que produce errores 400 confusos ("Clave
@@ -80,7 +81,7 @@ class ProductSerializer(serializers.ModelSerializer):
         model = models.Product
         fields = ["id", "name", "description", "price", "category", "image", "tags", "available",
                   "prepMinutes", "popular", "restockable", "isCombo", "comboItems", "componentsTotal",
-                  "variations", "taxes", "cost", "kind", "inventoryId", "inventoryQty"]
+                  "variations", "taxes", "cost", "kind", "needsPreparation", "inventoryId", "inventoryQty"]
 
     def validate_variations(self, value):
         """

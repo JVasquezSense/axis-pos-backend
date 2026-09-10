@@ -646,6 +646,20 @@ class CustomerViewSet(TenantQuerySet, viewsets.ModelViewSet):
     required_feature = "crm"
 
 
+def needs_kitchen(order):
+    """
+    ¿Este pedido tiene algo que preparar?
+
+    Basta con que una línea lo necesite: una hamburguesa con una gaseosa sigue
+    pasando por cocina. Un pedido sin líneas también, por prudencia: es más
+    barato que el cocinero lo descarte a que un plato se pierda.
+    """
+    lines = list(order.lines.select_related("product").all())
+    if not lines:
+        return True
+    return any(ln.product is None or ln.product.needs_preparation for ln in lines)
+
+
 class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Order.objects.prefetch_related("lines").order_by("-created_at")
     serializer_class = serializers.OrderSerializer
@@ -668,6 +682,21 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         tenant_id = self._resolve_tenant_id()
         order = serializer.save(tenant_id=tenant_id) if tenant_id else serializer.save()
+
+        # Pedido que no tiene nada que preparar (una ronda de cervezas, una
+        # cajetilla): nace listo. Recorrer el KDS para nada obligaba al mesero a
+        # ir a marcarlo antes de poder entregarlo.
+        if order.status == "pending" and not needs_kitchen(order):
+            order.status = "ready"
+            order.save(update_fields=["status"])
+            # El descuento de inventario cuelga del paso a "ready", que aquí no
+            # llega a ocurrir porque el pedido ya nace en ese estado.
+            try:
+                with transaction.atomic():
+                    consume_order_inventory(order)
+            except Exception:
+                pass
+
         sync_table_status(order.table)
         # Empuja ticket a cocina vía WebSocket
         try:
@@ -1682,6 +1711,16 @@ class PublicOrderView(drf_views.APIView):
                     summary=f"+{created_lines} producto(s) desde la carta web",
                     detail={"addedLines": created_lines},
                 )
+
+        # Igual que en el POS: un pedido web sin nada que preparar nace listo.
+        if order.status == "pending" and not needs_kitchen(order):
+            order.status = "ready"
+            order.save(update_fields=["status"])
+            try:
+                with transaction.atomic():
+                    consume_order_inventory(order)
+            except Exception:
+                pass
 
         # Ocupar la mesa es parte de tomar el pedido, no un detalle del POS.
         sync_table_status(order.table)
