@@ -150,6 +150,30 @@ class Category(TenantScoped):
         verbose_name_plural = "categories"
 
 
+class Tax(TenantScoped):
+    """
+    Impuesto del restaurante. Cada uno gestiona los suyos: el IVA del 8% venía
+    fijo en el código, y ni la tarifa ni el nombre valían para todos (un bar
+    liquida IVA del 19% más impuesto al consumo, una cafetería solo INC del 8%).
+    """
+    TYPE = [("percent", "Porcentual"), ("fixed", "Fijo por unidad")]
+
+    name = models.CharField(max_length=60)
+    type = models.CharField(max_length=10, choices=TYPE, default="percent")
+    # % cuando es porcentual, COP por unidad cuando es fijo.
+    rate = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    # Se aplica a los productos que no declaran impuestos propios.
+    is_default = models.BooleanField(default=False)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.rate}{'%' if self.type == 'percent' else ' COP'})"
+
+
 class Product(TenantScoped):
     # Cómo consume inventario este producto:
     #   simple   → ES un insumo y lo descuenta directo (una gaseosa, una cajetilla)

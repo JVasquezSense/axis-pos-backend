@@ -43,6 +43,14 @@ class ComboItemSerializer(serializers.ModelSerializer):
         fields = ["id", "productId", "name", "price", "image", "available", "quantity"]
 
 
+class TaxSerializer(serializers.ModelSerializer):
+    isDefault = serializers.BooleanField(source="is_default", required=False)
+
+    class Meta:
+        model = models.Tax
+        fields = ["id", "name", "type", "rate", "isDefault", "active"]
+
+
 class ProductSerializer(serializers.ModelSerializer):
     prepMinutes = serializers.IntegerField(source="prep_minutes")
     isCombo = serializers.BooleanField(source="is_combo", required=False)

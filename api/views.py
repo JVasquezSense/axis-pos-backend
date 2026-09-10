@@ -623,6 +623,15 @@ class TableViewSet(TenantQuerySet, viewsets.ModelViewSet):
             table.save(update_fields=["seated_at"])
 
 
+class TaxViewSet(TenantQuerySet, viewsets.ModelViewSet):
+    """
+    Impuestos del restaurante. Sin feature gate: sin impuestos no se puede
+    facturar, y cada país y cada negocio tiene los suyos.
+    """
+    queryset = models.Tax.objects.all()
+    serializer_class = serializers.TaxSerializer
+
+
 class RecipeViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Recipe.objects.prefetch_related("ingredients")
     serializer_class = serializers.RecipeSerializer
