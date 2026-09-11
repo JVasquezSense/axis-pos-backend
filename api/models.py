@@ -128,7 +128,24 @@ class UserProfile(models.Model):
     ROLE = [("admin","Admin"),("cashier","Cajero"),("waiter","Mesero"),("kitchen","Cocina"),("warehouse","Almacén")]
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile")
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="profiles", null=True, blank=True)
+    # `role` es el principal (el primero de `roles`) y se conserva por
+    # compatibilidad; `roles` es la lista completa. En un restaurante pequeño
+    # la misma persona es cajera y mesera, y un solo rol la obligaba a
+    # cambiar de cuenta según la hora.
     role = models.CharField(max_length=20, choices=ROLE, default="admin")
+    roles = models.JSONField(default=list, blank=True)
+
+    def save(self, *args, **kwargs):
+        valid = {code for code, _ in self.ROLE}
+        cleaned = [r for r in (self.roles or []) if r in valid]
+        if not cleaned:
+            cleaned = [self.role or "admin"]
+        self.roles = list(dict.fromkeys(cleaned))
+        self.role = self.roles[0]
+        super().save(*args, **kwargs)
+
+    def has_role(self, role):
+        return role in (self.roles or [self.role])
 
     def __str__(self):
         return f"{self.user.username} → {self.tenant}"
@@ -473,9 +490,20 @@ class Employee(TenantScoped):
     ]
     name = models.CharField(max_length=120)
     role = models.CharField(max_length=16, choices=ROLE, default="mesero")
+    # Lista completa; `role` queda como principal por compatibilidad.
+    roles = models.JSONField(default=list, blank=True)
     active = models.BooleanField(default=True)
     phone = models.CharField(max_length=30, blank=True)
     email = models.EmailField(blank=True)
+
+    def save(self, *args, **kwargs):
+        valid = {code for code, _ in self.ROLE}
+        cleaned = [r for r in (self.roles or []) if r in valid]
+        if not cleaned:
+            cleaned = [self.role or "mesero"]
+        self.roles = list(dict.fromkeys(cleaned))
+        self.role = self.roles[0]
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -506,6 +534,11 @@ class Sale(TenantScoped):
     observations = models.CharField(max_length=300, blank=True)
     # Número de factura correlativo por tenant (backlog #1).
     invoice_number = models.CharField(max_length=24, blank=True)
+    # De dónde salió el inventario que movió esta venta, para poder devolverlo
+    # si se anula: los pedidos que cobró, o —en venta directa, sin pedido— las
+    # líneas [{productId, quantity}] que descontó al cobrar.
+    orders = models.ManyToManyField("Order", blank=True, related_name="sales")
+    consumed_lines = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

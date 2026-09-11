@@ -481,9 +481,11 @@ class ReservationSerializer(serializers.ModelSerializer):
 # ─── Empleados ───────────────────────────────────────────────────────────────
 
 class EmployeeSerializer(serializers.ModelSerializer):
+    roles = serializers.ListField(child=serializers.CharField(), required=False)
+
     class Meta:
         model = models.Employee
-        fields = ["id", "name", "role", "active", "phone", "email"]
+        fields = ["id", "name", "role", "roles", "active", "phone", "email"]
 
 
 # ─── Usuarios de tenant ──────────────────────────────────────────────────────
@@ -493,6 +495,7 @@ class TenantUserSerializer(serializers.Serializer):
     username = serializers.CharField()
     email = serializers.EmailField()
     role = serializers.CharField()
+    roles = serializers.ListField(child=serializers.CharField(), required=False)
     is_active = serializers.BooleanField(default=True)
     password = serializers.CharField(write_only=True, required=False)
 
@@ -501,8 +504,10 @@ class TenantUserSerializer(serializers.Serializer):
         User = get_user_model()
         if isinstance(instance, User):
             role = "admin"
+            roles = ["admin"]
             try:
                 role = instance.profile.role
+                roles = instance.profile.roles or [role]
             except Exception:
                 pass
             return {
@@ -510,6 +515,7 @@ class TenantUserSerializer(serializers.Serializer):
                 "username": instance.first_name or instance.email,
                 "email": instance.email,
                 "role": role,
+                "roles": roles,
                 "is_active": instance.is_active,
             }
         return super().to_representation(instance)
@@ -566,14 +572,35 @@ class SaleSerializer(serializers.ModelSerializer):
     table = serializers.IntegerField(source="table_number", allow_null=True)
     waiter = serializers.CharField(allow_blank=True)
     ts = serializers.DateTimeField(source="created_at", read_only=True)
+    invoiceNumber = serializers.CharField(source="invoice_number", read_only=True)
+    # Solo al crear: qué pedidos cobra (para poder anularla y devolver el
+    # inventario) o, en venta directa, qué líneas descontó.
+    orderIds = serializers.ListField(child=serializers.CharField(), write_only=True, required=False)
+    consumedLines = serializers.ListField(child=serializers.DictField(), write_only=True, required=False)
+    orderCodes = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Sale
         fields = ["id", "total", "subtotal", "tax", "discount", "items", "method", "saleType",
-                  "table", "tip", "waiter", "customer", "observations", "invoiceNumber", "ts"]
+                  "table", "tip", "waiter", "customer", "observations", "invoiceNumber", "ts",
+                  "orderIds", "consumedLines", "orderCodes"]
         read_only_fields = ["ts", "invoiceNumber"]
 
-    invoiceNumber = serializers.CharField(source="invoice_number", read_only=True)
+    def get_orderCodes(self, obj):
+        return list(obj.orders.values_list("code", flat=True))
+
+    def create(self, validated_data):
+        order_ids = validated_data.pop("orderIds", []) or []
+        consumed = validated_data.pop("consumedLines", []) or []
+        validated_data["consumed_lines"] = [
+            {"productId": str(ln.get("productId")), "quantity": float(ln.get("quantity") or 0)}
+            for ln in consumed if ln.get("productId")
+        ]
+        sale = super().create(validated_data)
+        if order_ids:
+            # Solo pedidos del mismo restaurante: un id ajeno no debe colarse.
+            sale.orders.set(models.Order.objects.filter(tenant_id=sale.tenant_id, id__in=order_ids))
+        return sale
 
 
 # ─── WhatsApp ───────────────────────────────────────────────────────────────

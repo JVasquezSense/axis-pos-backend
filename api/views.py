@@ -205,13 +205,45 @@ def ingredient_consumption(ing, item):
     return quantity * (factor if factor is not None else 1.0)
 
 
-def consume_recipe_demand(tenant, demand, reason):
+def product_supplies(product_ids):
+    """
+    Insumos que consume UNA unidad de cada producto: {product_id: [(item, cantidad)]}.
+
+    Misma regla que el descuento real: el simple descuenta su insumo directo, el
+    compuesto los de su ficha técnica con merma y conversión de unidades. Es lo
+    que usa el reporte de salidas, para que lo que informa coincida con lo que
+    el kardex movió.
+    """
+    out = {}
+    products = {
+        p.id: p for p in models.Product.objects.filter(id__in=product_ids).select_related("inventory_item")
+    }
+    for pid, p in products.items():
+        if p.kind == "simple" and p.inventory_item_id:
+            out[pid] = [(p.inventory_item, float(p.inventory_qty or 1))]
+    compound_ids = [pid for pid in products if pid not in out]
+    for r in (models.Recipe.objects.filter(product_id__in=compound_ids)
+              .prefetch_related("ingredients__item")):
+        if r.product_id is None or r.product_id in out:
+            continue
+        portions = max(r.portions, 1)
+        rows = []
+        for ing in r.ingredients.all():
+            if ing.item_id is None or ing.item is None:
+                continue
+            rows.append((ing.item, ingredient_consumption(ing, ing.item) / portions))
+        out[r.product_id] = rows
+    return out
+
+
+def consume_recipe_demand(tenant, demand, reason, restore=False):
     """
     Descuenta del inventario los insumos que exige `demand` ({product_id: cantidad}),
     cruzando cada producto con su receta. Devuelve (items_afectados, movimientos).
 
     Es el núcleo compartido por el consumo del KDS y el de una venta directa de
-    caja (que nunca pasa por cocina).
+    caja (que nunca pasa por cocina). Con `restore=True` hace lo contrario:
+    devuelve al inventario lo que una venta anulada había descontado.
     """
     # Cada producto declara cómo consume: el simple descuenta el insumo que ES,
     # el compuesto los de su ficha técnica. Deducirlo de "tiene receta o no"
@@ -268,14 +300,17 @@ def consume_recipe_demand(tenant, demand, reason):
         item = items.get(item_id)
         if not item:
             continue
-        item.stock = max(float(item.stock) - consumed, 0)
+        if restore:
+            item.stock = float(item.stock) + consumed
+        else:
+            item.stock = max(float(item.stock) - consumed, 0)
         item.recompute_status()
         item.save(update_fields=["stock", "status", "updated_at"])
         movements.append(models.InventoryMovement.objects.create(
             tenant=tenant,
             item=item,
-            type="salida",
-            quantity=-consumed,
+            type="entrada" if restore else "salida",
+            quantity=consumed if restore else -consumed,
             balance=item.stock,
             unit_cost=item.cost,
             reason=reason,
@@ -817,7 +852,10 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
         username = request.data.get("username", "").strip()
         email = request.data.get("email", "").strip()
         password = request.data.get("password", "")
-        role = request.data.get("role", "admin")
+        roles = request.data.get("roles")
+        role = request.data.get("role") or (roles[0] if isinstance(roles, list) and roles else "admin")
+        if not isinstance(roles, list) or not roles:
+            roles = [role]
         if not email or not password:
             return response.Response({"error": "email y password requeridos"}, status=status.HTTP_400_BAD_REQUEST)
         if len(password) < 8:
@@ -838,7 +876,7 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
                 if username:
                     user.first_name = username
                     user.save(update_fields=["first_name"])
-                profile = models.UserProfile.objects.create(user=user, tenant=tenant, role=role)
+                profile = models.UserProfile.objects.create(user=user, tenant=tenant, role=role, roles=roles)
         except Exception as e:
             return response.Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return response.Response({
@@ -846,6 +884,7 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
             "username": user.first_name or user.email,
             "email": user.email,
             "role": profile.role,
+            "roles": profile.roles,
             "is_active": user.is_active,
         }, status=status.HTTP_201_CREATED)
 
@@ -883,9 +922,12 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
                         return response.Response({"error": "La contraseña debe tener al menos 8 caracteres"}, status=status.HTTP_400_BAD_REQUEST)
                     user.set_password(pwd)
                 user.save()
-                if "role" in request.data:
-                    profile.role = request.data["role"]
-                    profile.save(update_fields=["role"])
+                if "roles" in request.data and isinstance(request.data["roles"], list):
+                    profile.roles = request.data["roles"]
+                    profile.save()  # save() normaliza y fija `role` al principal
+                elif "role" in request.data:
+                    profile.roles = [request.data["role"]]
+                    profile.save()
         except Exception as e:
             return response.Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -894,6 +936,7 @@ class AdminTenantViewSet(viewsets.ModelViewSet):
             "username": user.first_name or user.email,
             "email": user.email,
             "role": profile.role,
+            "roles": profile.roles,
             "is_active": user.is_active,
         })
 
@@ -918,6 +961,7 @@ class MeView(drf_views.APIView):
             "isSuperuser": u.is_superuser,
             "hasProfile": profile is not None,
             "role": getattr(profile, "role", None),
+            "roles": (profile.roles or [profile.role]) if profile else None,
             "tenantId": str(tenant.id) if tenant else None,
             "tenantName": tenant.name if tenant else None,
             # El frontend necesita el slug para construir el QR por mesa y el
@@ -1144,7 +1188,58 @@ class AdminPlansView(drf_views.APIView):
 class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Sale.objects.all().order_by("-created_at")
     serializer_class = serializers.SaleSerializer
-    http_method_names = ["get", "post", "head", "options"]  # read + create only
+    # Sin PATCH: una venta no se edita, se anula y se hace otra.
+    http_method_names = ["get", "post", "delete", "head", "options"]
+
+    def perform_destroy(self, sale):
+        """
+        Anular una venta: solo el administrador del restaurante, y el
+        inventario que la venta descontó vuelve al kardex como entrada.
+
+        Si la venta cobró pedidos, se devuelven los de los pedidos que ninguna
+        otra venta siga cobrando (una cuenta dividida son varias ventas sobre
+        el mismo pedido: solo la última anulada devuelve el stock). En venta
+        directa se devuelven las líneas que descontó al cobrar.
+        """
+        from rest_framework.exceptions import PermissionDenied
+        profile = getattr(self.request.user, "profile", None)
+        if not self.request.user.is_superuser and not (profile and profile.has_role("admin")):
+            raise PermissionDenied("Solo el administrador puede anular ventas.")
+
+        reason = f"Anulación venta {sale.invoice_number or sale.id}"
+        touched, movements = [], []
+        with transaction.atomic():
+            for order in sale.orders.select_related("tenant").all():
+                if order.sales.exclude(pk=sale.pk).exists():
+                    continue
+                if order.stock_consumed:
+                    demand = expand_products(
+                        ((ln.product, ln.quantity) for ln in order.lines.select_related("product").all())
+                    )
+                    t, m = consume_recipe_demand(sale.tenant, demand, reason, restore=True)
+                    touched += t; movements += m
+                    order.stock_consumed = False
+                order.status = "cancelled"
+                order.save(update_fields=["status", "stock_consumed"])
+                sync_table_status(order.table)
+
+            if sale.consumed_lines:
+                ids = [ln.get("productId") for ln in sale.consumed_lines]
+                products = {str(p.id): p for p in models.Product.objects.filter(tenant=sale.tenant, id__in=ids)}
+                demand = expand_products(
+                    ((products.get(str(ln.get("productId"))), ln.get("quantity")) for ln in sale.consumed_lines)
+                )
+                t, m = consume_recipe_demand(sale.tenant, demand, reason, restore=True)
+                touched += t; movements += m
+
+            models.AuditLog.objects.create(
+                tenant=sale.tenant, action="Venta anulada", module="ventas",
+                user=self.request.user.get_username(),
+                details=f"{sale.invoice_number or sale.id} · ${sale.total} · {sale.method}"
+                        + (f" · {len(touched)} insumo(s) reintegrados" if touched else ""),
+            )
+            sale.delete()
+        broadcast_inventory(sale.tenant_id, touched, movements)
 
     def perform_create(self, serializer):
         # Backlog #1: asigna número de factura correlativo por tenant.
@@ -1485,6 +1580,39 @@ class DashboardView(drf_views.APIView):
         })
 
 
+def period_cost(tenant_id, start, end):
+    """
+    Costo real de lo vendido en el periodo: insumos de cada producto (receta o
+    insumo directo) o, si no tiene, su costo declarado. Sustituye la utilidad
+    "estimada" al 35% fijo, que no era de nadie.
+    """
+    if not tenant_id:
+        return 0.0
+    lines = (
+        models.OrderLine.objects
+        .filter(order__tenant_id=tenant_id, order__created_at__date__gte=start,
+                order__created_at__date__lte=end)
+        .exclude(order__status__in=("pending", "cancelled"))
+        .select_related("product")
+        .prefetch_related("product__combo_items__product")
+    )
+    lines = list(lines)
+    product_ids = set()
+    for ln in lines:
+        product_ids.update(expand_products([(ln.product, ln.quantity)]).keys())
+    supplies_of = product_supplies(product_ids)
+    declared = {p.id: float(p.cost or 0) for p in models.Product.objects.filter(id__in=product_ids)}
+    total = 0.0
+    for ln in lines:
+        for pid, qty in expand_products([(ln.product, ln.quantity)]).items():
+            rows = supplies_of.get(pid)
+            if rows:
+                total += sum(per_unit * float(item.cost) for item, per_unit in rows) * float(qty)
+            else:
+                total += declared.get(pid, 0.0) * float(qty)
+    return total
+
+
 class ReportsView(drf_views.APIView):
     """GET /api/v1/reports/executive/ — resumen ejecutivo últimos 30 días."""
 
@@ -1507,8 +1635,10 @@ class ReportsView(drf_views.APIView):
         prev_ord = prev.count()
         curr_avg = curr_rev / curr_ord if curr_ord else 0.0
         prev_avg = prev_rev / prev_ord if prev_ord else 0.0
-        curr_profit = curr_rev * 0.35
-        prev_profit = prev_rev * 0.35
+        curr_profit = curr_rev - period_cost(tenant_id, start_30, today)
+        prev_profit = prev_rev - period_cost(tenant_id, start_60, start_30 - timedelta(days=1))
+        # Proporción real del periodo, para escalar tendencias y sparklines.
+        margin = (curr_profit / curr_rev) if curr_rev > 0 else 0.0
 
         # Daily data — one query
         daily = {
@@ -1527,7 +1657,7 @@ class ReportsView(drf_views.APIView):
             {"id": "revenue", "label": "Ingresos 30d", "value": curr_rev, "format": "currency",
              "delta": _delta(curr_rev, prev_rev), "icon": "TrendingUp", "spark": spark},
             {"id": "profit", "label": "Utilidad Est. 30d", "value": round(curr_profit, 0), "format": "currency",
-             "delta": _delta(curr_profit, prev_profit), "icon": "PiggyBank", "spark": [round(v * 0.35, 0) for v in spark]},
+             "delta": _delta(curr_profit, prev_profit), "icon": "PiggyBank", "spark": [round(v * margin, 0) for v in spark]},
             {"id": "orders", "label": "Órdenes 30d", "value": curr_ord, "format": "number",
              "delta": _delta(curr_ord, prev_ord), "icon": "ShoppingBag", "spark": spark},
             {"id": "avg_ticket", "label": "Ticket Promedio", "value": round(curr_avg, 0), "format": "currency",
@@ -1538,7 +1668,7 @@ class ReportsView(drf_views.APIView):
             {"label": (today - timedelta(days=29 - i)).strftime("%d/%m"), "value": daily.get(today - timedelta(days=29 - i), 0.0)}
             for i in range(30)
         ]
-        profit_trend = [{"label": p["label"], "value": round(p["value"] * 0.35, 0)} for p in revenue_trend]
+        profit_trend = [{"label": p["label"], "value": round(p["value"] * margin, 0)} for p in revenue_trend]
 
         # Category mix from OrderLines
         cat_agg = (
@@ -1948,16 +2078,18 @@ class DishConsumptionView(drf_views.APIView):
                 product_ids.update(ci.product_id for ci in ln.product.combo_items.all())
             else:
                 product_ids.add(ln.product_id)
-        recipe_map = {}
-        for r in (models.Recipe.objects
-                  .filter(product_id__in=product_ids, tenant_id=tenant_id)
-                  .exclude(product__kind="simple")
-                  .prefetch_related("ingredients__item")):
-            if r.product_id is not None and r.product_id not in recipe_map:
-                recipe_map[r.product_id] = (max(r.portions, 1), list(r.ingredients.all()))
+        # Lo que consume una unidad de cada producto, con la misma regla que
+        # el descuento real: el simple su insumo directo, el compuesto su receta.
+        supplies_of = product_supplies(product_ids)
+        # Costo declarado del producto, para los que no tienen insumos que
+        # costear (un producto simple sin insumo vinculado).
+        product_cost = {
+            p.id: float(p.cost or 0)
+            for p in models.Product.objects.filter(id__in=product_ids)
+        }
 
-        # Acumuladores. Cada plato lleva su propio desglose de insumos (_supplies)
-        # para que el frontend muestre el consumo POR PLATO sin recalcular nada.
+        # Acumuladores. Cada producto lleva su propio desglose de insumos
+        # (_supplies) para que el frontend lo muestre sin recalcular nada.
         dish_agg = {}     # {product_id: {id, name, emoji, units, revenue, cost, _supplies}}
         supply_agg = {}   # agregado global {item_id: {id, name, unit, consumed, cost}}
 
@@ -1977,30 +2109,24 @@ class DishConsumptionView(drf_views.APIView):
 
             # Un combo aporta el consumo de sus componentes, atribuido al combo.
             for comp_id, comp_qty in expand_products([(ln.product, ln.quantity)]).items():
-                ings_portions = recipe_map.get(comp_id)
-                if not ings_portions:
+                rows = supplies_of.get(comp_id)
+                if not rows:
+                    # Sin insumos: el costo es el que declara el producto.
+                    d["cost"] += product_cost.get(comp_id, 0.0) * float(comp_qty)
                     continue
-                portions, ings = ings_portions
-                for ing in ings:
-                    if ing.item_id is None:
-                        continue
-                    effective = float(ing.quantity) * (1.0 + float(ing.waste or 0))
-                    consumed = (effective / portions) * float(comp_qty)
-                    cost = consumed * float(ing.item.cost) if ing.item else 0.0
-                    name = ing.item.name if ing.item else (ing.name or "—")
-                    unit = ing.item.unit if ing.item else (ing.unit or "")
+                for item, per_unit in rows:
+                    consumed = per_unit * float(comp_qty)
+                    cost = consumed * float(item.cost)
 
-                    # Global (todos los platos sumados).
-                    s = supply_agg.setdefault(ing.item_id, {
-                        "id": str(ing.item_id), "name": name, "unit": unit,
+                    s_ = supply_agg.setdefault(item.id, {
+                        "id": str(item.id), "name": item.name, "unit": item.unit,
                         "consumed": 0.0, "cost": 0.0,
                     })
-                    s["consumed"] += consumed
-                    s["cost"] += cost
+                    s_["consumed"] += consumed
+                    s_["cost"] += cost
 
-                    # Por plato (el combo acumula el de sus componentes).
-                    ds = d["_supplies"].setdefault(ing.item_id, {
-                        "id": str(ing.item_id), "name": name, "unit": unit,
+                    ds = d["_supplies"].setdefault(item.id, {
+                        "id": str(item.id), "name": item.name, "unit": item.unit,
                         "consumed": 0.0, "cost": 0.0,
                     })
                     ds["consumed"] += consumed
