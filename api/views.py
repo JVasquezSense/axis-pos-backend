@@ -1186,7 +1186,7 @@ class AdminPlansView(drf_views.APIView):
 
 
 class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
-    queryset = models.Sale.objects.all().order_by("-created_at")
+    queryset = models.Sale.objects.prefetch_related("orders__lines__product").order_by("-created_at")
     serializer_class = serializers.SaleSerializer
     # Sin PATCH: una venta no se edita, se anula y se hace otra.
     http_method_names = ["get", "post", "delete", "head", "options"]
@@ -1432,12 +1432,44 @@ COLORS = ["#6366f1", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#ec4899", "#14
 METHOD_LABELS = {"card": "Tarjeta", "cash": "Efectivo", "transfer": "Transferencia", "nequi": "Nequi"}
 
 
+RANGE_LABEL = {"today": "Hoy", "week": "Semana", "month": "Mes", "year": "Año"}
+
+
+def period_bounds(range_id, today):
+    """
+    (inicio, fin, inicio_previo, fin_previo) del periodo pedido. El periodo
+    previo es el equivalente inmediatamente anterior, para la variación. La
+    semana empieza el lunes.
+    """
+    if range_id == "week":
+        start = today - timedelta(days=today.weekday())
+        prev_start = start - timedelta(days=7)
+        return start, today, prev_start, start - timedelta(days=1)
+    if range_id == "month":
+        start = today.replace(day=1)
+        prev_end = start - timedelta(days=1)
+        return start, today, prev_end.replace(day=1), prev_end
+    if range_id == "year":
+        start = today.replace(month=1, day=1)
+        prev_end = start - timedelta(days=1)
+        return start, today, prev_end.replace(month=1, day=1), prev_end
+    return today, today, today - timedelta(days=1), today - timedelta(days=1)
+
+
 class DashboardView(drf_views.APIView):
-    """GET /api/v1/dashboard/summary/ — métricas en tiempo real."""
+    """
+    GET /api/v1/dashboard/summary/?range=today|week|month|year — métricas del
+    periodo. El selector del frontend existía pero no llegaba hasta aquí: los
+    KPI eran siempre de hoy, se eligiera lo que se eligiera.
+    """
 
     def get(self, request):
         today = timezone.localdate()
         yesterday = today - timedelta(days=1)
+        range_id = request.query_params.get("range", "today")
+        if range_id not in RANGE_LABEL:
+            range_id = "today"
+        start, end, prev_start, prev_end = period_bounds(range_id, today)
 
         sale_qs = _tenant_qs(models.Sale.objects.all(), request.user)
         inv_qs = _tenant_qs(models.InventoryItem.objects.all(), request.user)
@@ -1454,13 +1486,16 @@ class DashboardView(drf_views.APIView):
                 .annotate(total=Sum("total"))
             )
         }
-        rev_today = daily.get(today, 0.0)
-        rev_yday = daily.get(yesterday, 0.0)
+        in_period = sale_qs.filter(created_at__date__gte=start, created_at__date__lte=end)
+        in_prev = sale_qs.filter(created_at__date__gte=prev_start, created_at__date__lte=prev_end)
+        rev_today = float(in_period.aggregate(t=Sum("total"))["t"] or 0)
+        rev_yday = float(in_prev.aggregate(t=Sum("total"))["t"] or 0)
 
-        orders_today = sale_qs.filter(created_at__date=today).count()
-        orders_yday = sale_qs.filter(created_at__date=yesterday).count()
+        orders_today = in_period.count()
+        orders_yday = in_prev.count()
         avg_today = rev_today / orders_today if orders_today else 0.0
         avg_yday = rev_yday / orders_yday if orders_yday else 0.0
+        label = RANGE_LABEL[range_id]
 
         # Spark: last 7 days
         spark_rev = [daily.get(today - timedelta(days=i), 0.0) for i in range(6, -1, -1)]
@@ -1472,9 +1507,9 @@ class DashboardView(drf_views.APIView):
         critical_count = inv_qs.filter(status="critical").count()
 
         kpis = [
-            {"id": "revenue", "label": "Ventas Hoy", "value": rev_today, "format": "currency",
+            {"id": "revenue", "label": f"Ventas · {label}", "value": rev_today, "format": "currency",
              "delta": _delta(rev_today, rev_yday), "icon": "DollarSign", "spark": spark_rev},
-            {"id": "orders", "label": "Órdenes Hoy", "value": orders_today, "format": "number",
+            {"id": "orders", "label": f"Órdenes · {label}", "value": orders_today, "format": "number",
              "delta": _delta(orders_today, orders_yday), "icon": "ShoppingBag", "spark": spark_ord},
             {"id": "avg_ticket", "label": "Ticket Promedio", "value": round(avg_today, 0), "format": "currency",
              "delta": _delta(avg_today, avg_yday), "icon": "Receipt", "spark": spark_rev},
@@ -1486,8 +1521,7 @@ class DashboardView(drf_views.APIView):
         hourly = {
             r["h"]: float(r["total"])
             for r in (
-                sale_qs
-                .filter(created_at__date=today)
+                in_period
                 .annotate(h=ExtractHour("created_at"))
                 .values("h")
                 .annotate(total=Sum("total"))
@@ -1526,8 +1560,12 @@ class DashboardView(drf_views.APIView):
 
         # Top products from OrderLines
         tenant_id = resolve_tenant_id(request.user)
-        raw_lines = models.OrderLine.objects.filter(order__tenant_id=tenant_id) if tenant_id \
-            else models.OrderLine.objects.none()
+        raw_lines = (
+            models.OrderLine.objects.filter(
+                order__tenant_id=tenant_id,
+                order__created_at__date__gte=start, order__created_at__date__lte=end,
+            ) if tenant_id else models.OrderLine.objects.none()
+        )
         top_raw = (
             raw_lines
             .values("product__id", "product__name", "product__image", "product__category__name")
@@ -1618,8 +1656,19 @@ class ReportsView(drf_views.APIView):
 
     def get(self, request):
         today = timezone.localdate()
-        start_30 = today - timedelta(days=29)
-        start_60 = today - timedelta(days=59)
+        # ?range=today|week|month|year. Sin parámetro, los últimos 30 días, que
+        # es lo que siempre había mostrado. Los nombres start_30/start_60 se
+        # conservan: son "inicio del periodo" e "inicio del periodo anterior".
+        range_id = request.query_params.get("range")
+        if range_id in RANGE_LABEL:
+            start_30, _end, start_60, prev_end = period_bounds(range_id, today)
+            period_label = RANGE_LABEL[range_id]
+        else:
+            start_30 = today - timedelta(days=29)
+            start_60 = today - timedelta(days=59)
+            prev_end = start_30 - timedelta(days=1)
+            period_label = "30d"
+        span_days = max((today - start_30).days + 1, 1)
 
         sale_qs = _tenant_qs(models.Sale.objects.all(), request.user)
         tenant_id = resolve_tenant_id(request.user)
@@ -1627,7 +1676,7 @@ class ReportsView(drf_views.APIView):
             else models.OrderLine.objects.none()
 
         curr = sale_qs.filter(created_at__date__gte=start_30)
-        prev = sale_qs.filter(created_at__date__gte=start_60, created_at__date__lt=start_30)
+        prev = sale_qs.filter(created_at__date__gte=start_60, created_at__date__lte=prev_end)
 
         curr_rev = float(curr.aggregate(t=Sum("total"))["t"] or 0)
         prev_rev = float(prev.aggregate(t=Sum("total"))["t"] or 0)
@@ -1636,7 +1685,7 @@ class ReportsView(drf_views.APIView):
         curr_avg = curr_rev / curr_ord if curr_ord else 0.0
         prev_avg = prev_rev / prev_ord if prev_ord else 0.0
         curr_profit = curr_rev - period_cost(tenant_id, start_30, today)
-        prev_profit = prev_rev - period_cost(tenant_id, start_60, start_30 - timedelta(days=1))
+        prev_profit = prev_rev - period_cost(tenant_id, start_60, prev_end)
         # Proporción real del periodo, para escalar tendencias y sparklines.
         margin = (curr_profit / curr_rev) if curr_rev > 0 else 0.0
 
@@ -1654,20 +1703,32 @@ class ReportsView(drf_views.APIView):
         spark = [daily.get(today - timedelta(days=i), 0.0) for i in range(6, -1, -1)]
 
         kpis = [
-            {"id": "revenue", "label": "Ingresos 30d", "value": curr_rev, "format": "currency",
+            {"id": "revenue", "label": f"Ingresos · {period_label}", "value": curr_rev, "format": "currency",
              "delta": _delta(curr_rev, prev_rev), "icon": "TrendingUp", "spark": spark},
-            {"id": "profit", "label": "Utilidad Est. 30d", "value": round(curr_profit, 0), "format": "currency",
+            {"id": "profit", "label": f"Utilidad · {period_label}", "value": round(curr_profit, 0), "format": "currency",
              "delta": _delta(curr_profit, prev_profit), "icon": "PiggyBank", "spark": [round(v * margin, 0) for v in spark]},
-            {"id": "orders", "label": "Órdenes 30d", "value": curr_ord, "format": "number",
+            {"id": "orders", "label": f"Órdenes · {period_label}", "value": curr_ord, "format": "number",
              "delta": _delta(curr_ord, prev_ord), "icon": "ShoppingBag", "spark": spark},
             {"id": "avg_ticket", "label": "Ticket Promedio", "value": round(curr_avg, 0), "format": "currency",
              "delta": _delta(curr_avg, prev_avg), "icon": "Receipt", "spark": spark},
         ]
 
-        revenue_trend = [
-            {"label": (today - timedelta(days=29 - i)).strftime("%d/%m"), "value": daily.get(today - timedelta(days=29 - i), 0.0)}
-            for i in range(30)
-        ]
+        # Tendencia diaria del periodo (hasta 60 puntos; el año se muestra por
+        # semanas para que la gráfica se pueda leer).
+        if span_days <= 60:
+            revenue_trend = [
+                {"label": (start_30 + timedelta(days=i)).strftime("%d/%m"),
+                 "value": daily.get(start_30 + timedelta(days=i), 0.0)}
+                for i in range(span_days)
+            ]
+        else:
+            revenue_trend = []
+            cursor = start_30
+            while cursor <= today:
+                week_end = min(cursor + timedelta(days=6), today)
+                value = sum(daily.get(cursor + timedelta(days=k), 0.0) for k in range((week_end - cursor).days + 1))
+                revenue_trend.append({"label": cursor.strftime("%d/%m"), "value": value})
+                cursor = week_end + timedelta(days=1)
         profit_trend = [{"label": p["label"], "value": round(p["value"] * margin, 0)} for p in revenue_trend]
 
         # Category mix from OrderLines

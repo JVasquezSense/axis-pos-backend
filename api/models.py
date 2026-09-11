@@ -539,6 +539,11 @@ class Sale(TenantScoped):
     # líneas [{productId, quantity}] que descontó al cobrar.
     orders = models.ManyToManyField("Order", blank=True, related_name="sales")
     consumed_lines = models.JSONField(default=list, blank=True)
+    # Lo que se cobró, tal cual salió en el ticket: [{name, quantity, unitPrice,
+    # total, notes}] y el desglose de impuestos [{name, amount}]. Sin esto, el
+    # historial solo sabía el total y no qué se vendió.
+    lines = models.JSONField(default=list, blank=True)
+    taxes = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

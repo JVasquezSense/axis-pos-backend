@@ -578,16 +578,36 @@ class SaleSerializer(serializers.ModelSerializer):
     orderIds = serializers.ListField(child=serializers.CharField(), write_only=True, required=False)
     consumedLines = serializers.ListField(child=serializers.DictField(), write_only=True, required=False)
     orderCodes = serializers.SerializerMethodField()
+    lines = serializers.JSONField(required=False)
+    taxes = serializers.JSONField(required=False)
 
     class Meta:
         model = models.Sale
         fields = ["id", "total", "subtotal", "tax", "discount", "items", "method", "saleType",
                   "table", "tip", "waiter", "customer", "observations", "invoiceNumber", "ts",
-                  "orderIds", "consumedLines", "orderCodes"]
+                  "orderIds", "consumedLines", "orderCodes", "lines", "taxes"]
         read_only_fields = ["ts", "invoiceNumber"]
 
     def get_orderCodes(self, obj):
         return list(obj.orders.values_list("code", flat=True))
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Ventas anteriores a que se guardara el detalle: se reconstruye desde
+        # los pedidos que cobró, si los hay.
+        if not data.get("lines"):
+            data["lines"] = [
+                {
+                    "name": ln.product.name if ln.product else "—",
+                    "quantity": ln.quantity,
+                    "unitPrice": float(ln.unit_price),
+                    "total": float(ln.unit_price) * ln.quantity,
+                    "notes": ln.notes or "",
+                }
+                for order in instance.orders.all()
+                for ln in order.lines.select_related("product").all()
+            ]
+        return data
 
     def create(self, validated_data):
         order_ids = validated_data.pop("orderIds", []) or []
