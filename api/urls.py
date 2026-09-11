@@ -28,6 +28,9 @@ router.register("whatsapp/config", views.WhatsAppConfigViewSet, basename="wa-con
 
 urlpatterns = router.urls + [
     path("auth/me/", views.MeView.as_view(), name="auth-me"),
+    path("auth/me/profile/", views.MeUpdateView.as_view(), name="auth-me-profile"),
+    path("auth/change-password/", views.ChangePasswordView.as_view(), name="auth-change-password"),
+    path("tenant/settings/", views.TenantSettingsView.as_view(), name="tenant-settings"),
     path("dashboard/summary/", views.DashboardView.as_view(), name="dashboard-summary"),
     path("reports/executive/", views.ReportsView.as_view(), name="reports-executive"),
     path("reports/dish-consumption/", views.DishConsumptionView.as_view(), name="reports-dish-consumption"),

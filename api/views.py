@@ -913,6 +913,8 @@ class MeView(drf_views.APIView):
             "id": u.id,
             "username": u.get_username(),
             "email": u.email,
+            "firstName": u.first_name,
+            "lastName": u.last_name,
             "isSuperuser": u.is_superuser,
             "hasProfile": profile is not None,
             "role": getattr(profile, "role", None),
@@ -929,6 +931,115 @@ class MeView(drf_views.APIView):
             "tenantMaxUsers": tenant.max_users if tenant else None,
             "resolvedTenantId": str(resolved) if resolved else None,
         })
+
+
+class MeUpdateView(drf_views.APIView):
+    """
+    PATCH /api/v1/auth/me/profile/ — nombre y correo del propio usuario.
+
+    "Mi perfil" en la barra superior no llevaba a ningún sitio: solo mostraba
+    un aviso. Es lo mínimo que un usuario espera poder cambiar de sí mismo.
+    """
+    def patch(self, request):
+        u = request.user
+        first = request.data.get("firstName")
+        last = request.data.get("lastName")
+        email = request.data.get("email")
+        if first is not None:
+            u.first_name = str(first)[:150]
+        if last is not None:
+            u.last_name = str(last)[:150]
+        if email is not None:
+            u.email = str(email)[:254]
+        u.save(update_fields=["first_name", "last_name", "email"])
+        return response.Response({
+            "id": u.id, "username": u.get_username(), "email": u.email,
+            "firstName": u.first_name, "lastName": u.last_name,
+        })
+
+
+class ChangePasswordView(drf_views.APIView):
+    """POST /api/v1/auth/change-password/ — {current, new}. Solo el propio usuario."""
+    def post(self, request):
+        current = str(request.data.get("current") or "")
+        new = str(request.data.get("new") or "")
+        if not request.user.check_password(current):
+            return response.Response({"error": "La contraseña actual no es correcta."},
+                                     status=status.HTTP_400_BAD_REQUEST)
+        if len(new) < 8:
+            return response.Response({"error": "La nueva contraseña debe tener al menos 8 caracteres."},
+                                     status=status.HTTP_400_BAD_REQUEST)
+        request.user.set_password(new)
+        request.user.save(update_fields=["password"])
+        return response.Response({"ok": True})
+
+
+# Lo que el restaurante puede cambiar de sí mismo. El plan, el estado y el
+# consecutivo de factura los gobierna el superadmin o el sistema.
+TENANT_EDITABLE = {
+    "name": ("name", 120), "logo": ("logo", 100000), "city": ("city", 80),
+    "address": ("address", 200), "phone": ("phone", 40),
+    "taxId": ("tax_id", 40), "legalName": ("legal_name", 160),
+    "resolution": ("resolution", 200), "invoicePrefix": ("invoice_prefix", 12),
+}
+
+
+class TenantSettingsView(drf_views.APIView):
+    """
+    GET/PATCH /api/v1/tenant/settings/ — configuración del propio restaurante.
+
+    "Configuración" y "Facturación" de la barra superior llevaban a /admin, la
+    pantalla del superadmin, que un restaurante no puede abrir. Aquí vive lo
+    suyo: identidad, datos fiscales para la factura y el resumen de su plan.
+    """
+
+    def _tenant(self, request):
+        tenant_id = resolve_tenant_id(request.user)
+        return models.Tenant.objects.filter(pk=tenant_id).first() if tenant_id else None
+
+    def _out(self, tenant):
+        plan = models.Plan.objects.filter(code=tenant.plan).first()
+        users = models.UserProfile.objects.filter(tenant=tenant).count()
+        return {
+            "name": tenant.name, "slug": tenant.slug, "logo": tenant.logo,
+            "city": tenant.city, "address": tenant.address, "phone": tenant.phone,
+            "taxId": tenant.tax_id, "legalName": tenant.legal_name,
+            "resolution": tenant.resolution, "invoicePrefix": tenant.invoice_prefix,
+            "invoiceSeq": tenant.invoice_seq,
+            "plan": tenant.plan, "planName": plan.name if plan else tenant.plan,
+            "planPrice": plan.price if plan else 0,
+            "status": tenant.status,
+            "maxUsers": tenant.max_users, "users": users,
+            "features": tenant.effective_features(),
+            "createdAt": tenant.created_at,
+        }
+
+    def get(self, request):
+        tenant = self._tenant(request)
+        if tenant is None:
+            return response.Response({"error": "Sin restaurante"}, status=status.HTTP_404_NOT_FOUND)
+        return response.Response(self._out(tenant))
+
+    def patch(self, request):
+        tenant = self._tenant(request)
+        if tenant is None:
+            return response.Response({"error": "Sin restaurante"}, status=status.HTTP_404_NOT_FOUND)
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        if role != "admin" and not request.user.is_superuser:
+            return response.Response({"error": "Solo el administrador puede cambiar la configuración."},
+                                     status=status.HTTP_403_FORBIDDEN)
+        changed = []
+        for key, (field, limit) in TENANT_EDITABLE.items():
+            if key in request.data:
+                setattr(tenant, field, str(request.data.get(key) or "")[:limit])
+                changed.append(field)
+        if not changed:
+            return response.Response(self._out(tenant))
+        if not tenant.name.strip():
+            return response.Response({"error": "El nombre no puede quedar vacío."},
+                                     status=status.HTTP_400_BAD_REQUEST)
+        tenant.save(update_fields=changed)
+        return response.Response(self._out(tenant))
 
 
 class AdminMetricsView(drf_views.APIView):
