@@ -485,9 +485,12 @@ class Employee(TenantScoped):
 
 class Sale(TenantScoped):
     """Registro de ventas completadas desde el POS."""
+    # Los mismos que ofrece la caja. Daviplata y PSE existían en el POS pero no
+    # aquí, y cobrar con ellos devolvía "no es una elección válida".
     METHODS = [
         ("card", "Tarjeta"), ("cash", "Efectivo"),
         ("transfer", "Transferencia"), ("nequi", "Nequi"),
+        ("daviplata", "Daviplata"), ("pse", "PSE"),
     ]
     total = models.DecimalField(max_digits=14, decimal_places=2)
     subtotal = models.DecimalField(max_digits=14, decimal_places=2, default=0)
