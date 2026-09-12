@@ -360,6 +360,23 @@ class RecipeIngredientSerializer(serializers.ModelSerializer):
 
 class RecipeSerializer(serializers.ModelSerializer):
     ingredients = RecipeIngredientSerializer(many=True)
+
+    def validate_product(self, product):
+        """
+        Una receta por producto. Con dos, el descuento de inventario tomaba una
+        al azar y la carta abría "la receta de la Coca Cola" al editar un roll.
+        """
+        if product is None:
+            return product
+        qs = models.Recipe.objects.filter(product=product)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            other = qs.first()
+            raise serializers.ValidationError(
+                f"«{product.name}» ya tiene la ficha técnica «{other.name}». Edítala o desvincúlala primero."
+            )
+        return product
     productId = NullablePKField(
         source="product", queryset=models.Product.objects.all(), required=False, allow_null=True
     )
