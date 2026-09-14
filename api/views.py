@@ -1329,10 +1329,21 @@ class ShiftCloseViewSet(TenantQuerySet, viewsets.ModelViewSet):
         closed_by = (serializer.validated_data.get("closed_by") or "").strip()
         if not closed_by or closed_by == "Administrador":
             closed_by = user.get_full_name().strip() or user.username
-        super().perform_create(serializer)
-        if serializer.instance.closed_by != closed_by:
-            serializer.instance.closed_by = closed_by
-            serializer.instance.save(update_fields=["closed_by"])
+        tenant_id = self._resolve_tenant_id()
+        with transaction.atomic():
+            # Número correlativo por restaurante y arranque del turno: donde
+            # cerró el anterior; si es el primero, en la primera venta cobrada.
+            last = (models.ShiftClose.objects.select_for_update()
+                    .filter(tenant_id=tenant_id).order_by("-number", "-created_at").first())
+            number = (last.number if last else 0) + 1
+            started_at = last.created_at if last else None
+            if started_at is None:
+                first_sale = models.Sale.objects.filter(tenant_id=tenant_id).order_by("created_at").first()
+                started_at = first_sale.created_at if first_sale else timezone.now()
+            super().perform_create(serializer)
+            inst = serializer.instance
+            inst.number, inst.started_at, inst.closed_by = number, started_at, closed_by
+            inst.save(update_fields=["number", "started_at", "closed_by"])
 
 
 class DeliveryViewSet(TenantQuerySet, viewsets.ModelViewSet):
@@ -1614,7 +1625,8 @@ class DashboardView(drf_views.APIView):
             models.OrderLine.objects.filter(
                 order__tenant_id=tenant_id,
                 order__created_at__date__gte=start, order__created_at__date__lte=end,
-            ) if tenant_id else models.OrderLine.objects.none()
+            ).exclude(order__status="cancelled")  # una venta anulada cancela su pedido
+            if tenant_id else models.OrderLine.objects.none()
         )
         top_raw = (
             raw_lines
@@ -1722,8 +1734,10 @@ class ReportsView(drf_views.APIView):
 
         sale_qs = _tenant_qs(models.Sale.objects.all(), request.user)
         tenant_id = resolve_tenant_id(request.user)
-        line_qs = models.OrderLine.objects.filter(order__tenant_id=tenant_id) if tenant_id \
-            else models.OrderLine.objects.none()
+        # Sin pedidos cancelados: al anular una venta, su pedido queda cancelado
+        # y no debe seguir sumando en top productos ni categorías.
+        line_qs = models.OrderLine.objects.filter(order__tenant_id=tenant_id).exclude(order__status="cancelled") \
+            if tenant_id else models.OrderLine.objects.none()
 
         curr = sale_qs.filter(created_at__date__gte=start_30)
         prev = sale_qs.filter(created_at__date__gte=start_60, created_at__date__lte=prev_end)
@@ -2176,7 +2190,7 @@ class DishConsumptionView(drf_views.APIView):
             models.OrderLine.objects
             .filter(order__tenant_id=tenant_id)
             .filter(order__created_at__date__gte=start, order__created_at__date__lte=end)
-            .exclude(order__status="pending")
+            .exclude(order__status__in=("pending", "cancelled"))
             .select_related("product")
             .prefetch_related("product__combo_items__product")
         )

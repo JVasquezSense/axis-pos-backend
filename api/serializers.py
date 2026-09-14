@@ -734,14 +734,19 @@ class ShiftCloseSerializer(serializers.ModelSerializer):
     byWaiter = serializers.JSONField(source="by_waiter", required=False)
     closedBy = serializers.CharField(source="closed_by", required=False, allow_blank=True)
     ts = serializers.SerializerMethodField()
+    startedAt = serializers.SerializerMethodField()
 
     class Meta:
         model = models.ShiftClose
-        fields = ["id", "sales", "orders", "avg", "totalTips", "byMethod", "byWaiter",
-                  "closedBy", "records", "ts"]
+        fields = ["id", "number", "sales", "orders", "avg", "totalTips", "byMethod", "byWaiter",
+                  "closedBy", "records", "startedAt", "ts"]
+        read_only_fields = ["number"]
 
     def get_ts(self, obj):
         return int(obj.created_at.timestamp() * 1000)
+
+    def get_startedAt(self, obj):
+        return int(obj.started_at.timestamp() * 1000) if obj.started_at else None
 
 
 class DeliverySerializer(serializers.ModelSerializer):

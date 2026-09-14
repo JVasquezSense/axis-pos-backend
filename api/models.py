@@ -574,6 +574,10 @@ class AuditLog(TenantScoped):
 
 class ShiftClose(TenantScoped):
     """Cierre de turno: totales del turno y snapshot de las ventas incluidas."""
+    # Correlativo por restaurante ("Turno #12") y ventana real del turno:
+    # arranca donde cerró el anterior (o en la primera venta) y termina aquí.
+    number = models.PositiveIntegerField(default=0, db_index=True)
+    started_at = models.DateTimeField(null=True, blank=True)
     sales_total = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     orders = models.PositiveIntegerField(default=0)
     avg_ticket = models.DecimalField(max_digits=14, decimal_places=2, default=0)
