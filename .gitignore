@@ -13,3 +13,4 @@ media/
 .venv/
 venv/
 _t*.py
+_run.sh
