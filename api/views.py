@@ -1185,11 +1185,45 @@ class AdminPlansView(drf_views.APIView):
         return response.Response(self._out(obj))
 
 
+def filter_by_dates(qs, params, field="created_at"):
+    """
+    `?from=YYYY-MM-DD&to=YYYY-MM-DD` sobre la fecha local del registro. Los
+    dos extremos son inclusivos; sin parámetros no filtra.
+    """
+    day_from = params.get("from")
+    day_to = params.get("to")
+    if day_from:
+        qs = qs.filter(**{f"{field}__date__gte": day_from})
+    if day_to:
+        qs = qs.filter(**{f"{field}__date__lte": day_to})
+    return qs
+
+
+def open_shift_since(tenant_id):
+    """Instante del último cierre de turno del restaurante; None si nunca cerró."""
+    last = models.ShiftClose.objects.filter(tenant_id=tenant_id).order_by("-created_at").first()
+    return last.created_at if last else None
+
+
 class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Sale.objects.prefetch_related("orders__lines__product").order_by("-created_at")
     serializer_class = serializers.SaleSerializer
     # Sin PATCH: una venta no se edita, se anula y se hace otra.
     http_method_names = ["get", "post", "delete", "head", "options"]
+
+    def get_queryset(self):
+        """
+        `?shift=open` deja solo las ventas posteriores al último cierre de
+        turno: antes la caja y el cierre traían TODO el histórico y el
+        "total del turno" era el total de la vida del restaurante.
+        `?from`/`?to` acotan por fecha.
+        """
+        qs = filter_by_dates(super().get_queryset(), self.request.query_params)
+        if self.request.query_params.get("shift") == "open":
+            since = open_shift_since(self._resolve_tenant_id())
+            if since:
+                qs = qs.filter(created_at__gt=since)
+        return qs
 
     def perform_destroy(self, sale):
         """
@@ -1278,11 +1312,27 @@ class AuditLogViewSet(TenantQuerySet, viewsets.ModelViewSet):
 
 
 class ShiftCloseViewSet(TenantQuerySet, viewsets.ModelViewSet):
-    """Cierres de turno. Filtrados por tenant."""
+    """Cierres de turno. Filtrados por tenant y, opcionalmente, por fecha."""
     queryset = models.ShiftClose.objects.all()
     serializer_class = serializers.ShiftCloseSerializer
-    required_feature = "shift-history"
+    # Cerrar turno es parte de "shift" (lo tiene hasta el plan Mini); el
+    # historial es solo otra vista de estos mismos registros.
+    required_feature = "shift"
     http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        return filter_by_dates(super().get_queryset(), self.request.query_params)
+
+    def perform_create(self, serializer):
+        # Quién cierra: el usuario autenticado, no un texto fijo del cliente.
+        user = self.request.user
+        closed_by = (serializer.validated_data.get("closed_by") or "").strip()
+        if not closed_by or closed_by == "Administrador":
+            closed_by = user.get_full_name().strip() or user.username
+        super().perform_create(serializer)
+        if serializer.instance.closed_by != closed_by:
+            serializer.instance.closed_by = closed_by
+            serializer.instance.save(update_fields=["closed_by"])
 
 
 class DeliveryViewSet(TenantQuerySet, viewsets.ModelViewSet):
