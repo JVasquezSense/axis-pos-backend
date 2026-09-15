@@ -9,7 +9,7 @@ from django.db.models import Sum, Count, F
 from django.db.models.functions import TruncDate, ExtractHour
 from django.utils import timezone
 from django.db import transaction
-from datetime import timedelta
+from datetime import date, timedelta
 from . import models, serializers
 
 
@@ -1496,6 +1496,32 @@ METHOD_LABELS = {"card": "Tarjeta", "cash": "Efectivo", "transfer": "Transferenc
 RANGE_LABEL = {"today": "Hoy", "week": "Semana", "month": "Mes", "year": "Año"}
 
 
+def custom_bounds(params, today, sale_qs=None):
+    """
+    `?from=YYYY-MM-DD&to=YYYY-MM-DD` como periodo libre; devuelve None si no
+    vienen. El periodo previo es el tramo de igual largo inmediatamente
+    anterior. Sin `from`, arranca en la primera venta del restaurante
+    ("Todo").
+    """
+    day_from, day_to = params.get("from"), params.get("to")
+    if day_from is None and day_to is None:
+        return None
+    try:
+        end = date.fromisoformat(day_to) if day_to else today
+        if day_from:
+            start = date.fromisoformat(day_from)
+        else:
+            first = sale_qs.order_by("created_at").first() if sale_qs is not None else None
+            start = timezone.localtime(first.created_at).date() if first else end
+    except ValueError:
+        return None
+    if start > end:
+        start, end = end, start
+    span = (end - start).days + 1
+    prev_end = start - timedelta(days=1)
+    return start, end, prev_end - timedelta(days=span - 1), prev_end
+
+
 def period_bounds(range_id, today):
     """
     (inicio, fin, inicio_previo, fin_previo) del periodo pedido. El periodo
@@ -1530,9 +1556,13 @@ class DashboardView(drf_views.APIView):
         range_id = request.query_params.get("range", "today")
         if range_id not in RANGE_LABEL:
             range_id = "today"
-        start, end, prev_start, prev_end = period_bounds(range_id, today)
-
         sale_qs = _tenant_qs(models.Sale.objects.all(), request.user)
+        custom = custom_bounds(request.query_params, today, sale_qs)
+        if custom:
+            start, end, prev_start, prev_end = custom
+        else:
+            start, end, prev_start, prev_end = period_bounds(range_id, today)
+
         inv_qs = _tenant_qs(models.InventoryItem.objects.all(), request.user)
         table_qs = _tenant_qs(models.Table.objects.all(), request.user)
         order_qs = _tenant_qs(models.Order.objects.all(), request.user)
@@ -1556,7 +1586,7 @@ class DashboardView(drf_views.APIView):
         orders_yday = in_prev.count()
         avg_today = rev_today / orders_today if orders_today else 0.0
         avg_yday = rev_yday / orders_yday if orders_yday else 0.0
-        label = RANGE_LABEL[range_id]
+        label = f"{start:%d/%m} – {end:%d/%m}" if custom else RANGE_LABEL[range_id]
 
         # Spark: last 7 days
         spark_rev = [daily.get(today - timedelta(days=i), 0.0) for i in range(6, -1, -1)]
@@ -1722,7 +1752,11 @@ class ReportsView(drf_views.APIView):
         # es lo que siempre había mostrado. Los nombres start_30/start_60 se
         # conservan: son "inicio del periodo" e "inicio del periodo anterior".
         range_id = request.query_params.get("range")
-        if range_id in RANGE_LABEL:
+        custom = custom_bounds(request.query_params, today, _tenant_qs(models.Sale.objects.all(), request.user))
+        if custom:
+            start_30, today, start_60, prev_end = custom
+            period_label = f"{start_30:%d/%m} – {today:%d/%m}"
+        elif range_id in RANGE_LABEL:
             start_30, _end, start_60, prev_end = period_bounds(range_id, today)
             period_label = RANGE_LABEL[range_id]
         else:
@@ -1739,7 +1773,7 @@ class ReportsView(drf_views.APIView):
         line_qs = models.OrderLine.objects.filter(order__tenant_id=tenant_id).exclude(order__status="cancelled") \
             if tenant_id else models.OrderLine.objects.none()
 
-        curr = sale_qs.filter(created_at__date__gte=start_30)
+        curr = sale_qs.filter(created_at__date__gte=start_30, created_at__date__lte=today)
         prev = sale_qs.filter(created_at__date__gte=start_60, created_at__date__lte=prev_end)
 
         curr_rev = float(curr.aggregate(t=Sum("total"))["t"] or 0)
@@ -1758,7 +1792,7 @@ class ReportsView(drf_views.APIView):
             r["day"]: float(r["total"])
             for r in (
                 sale_qs
-                .filter(created_at__date__gte=start_30)
+                .filter(created_at__date__gte=start_30, created_at__date__lte=today)
                 .annotate(day=TruncDate("created_at"))
                 .values("day")
                 .annotate(total=Sum("total"))
@@ -1798,7 +1832,7 @@ class ReportsView(drf_views.APIView):
         # Category mix from OrderLines
         cat_agg = (
             line_qs
-            .filter(order__created_at__date__gte=start_30)
+            .filter(order__created_at__date__gte=start_30, order__created_at__date__lte=today)
             .values("product__category__name")
             .annotate(revenue=Sum(F("quantity") * F("unit_price")))
             .order_by("-revenue")
@@ -1834,7 +1868,7 @@ class ReportsView(drf_views.APIView):
         # Top dishes from OrderLines
         top_raw = (
             line_qs
-            .filter(order__created_at__date__gte=start_30)
+            .filter(order__created_at__date__gte=start_30, order__created_at__date__lte=today)
             .values("product__name")
             .annotate(units=Sum("quantity"), revenue=Sum(F("quantity") * F("unit_price")))
             .order_by("-revenue")[:10]
@@ -1859,7 +1893,7 @@ class ReportsView(drf_views.APIView):
 
         # Backlog #6: panel de devoluciones (notas de crédito) filtrado por tenant.
         credit_qs = _tenant_qs(models.CreditNote.objects.all(), request.user)
-        credit_curr = credit_qs.filter(created_at__date__gte=start_30)
+        credit_curr = credit_qs.filter(created_at__date__gte=start_30, created_at__date__lte=today)
         returns_count = credit_curr.count()
         returns_total = float(credit_curr.aggregate(t=Sum("total"))["t"] or 0)
         returns_by_reason = [
