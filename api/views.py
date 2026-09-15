@@ -732,6 +732,12 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
             except Exception:
                 pass
 
+        # Quién marcó la mesa: el usuario que tomó el primer pedido. Antes la
+        # mesa quedaba sin encargado (o con "" cuando el cliente la ocupaba).
+        if order.table and not (order.table.waiter or "").strip() and self.request.user.is_authenticated:
+            user = self.request.user
+            order.table.waiter = user.get_full_name().strip() or user.username
+            order.table.save(update_fields=["waiter"])
         sync_table_status(order.table)
         # Empuja ticket a cocina vía WebSocket
         try:
