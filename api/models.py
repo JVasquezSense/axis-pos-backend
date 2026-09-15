@@ -361,6 +361,18 @@ class Table(TenantScoped):
     y = models.FloatField(default=50)
     shape = models.CharField(max_length=10, choices=SHAPE, default="square")
 
+    def save(self, *args, **kwargs):
+        # Invariante: una mesa libre no tiene hora de sentada ni encargado.
+        # Había caminos (unir/separar, reservas, cobro) que la dejaban libre
+        # con seated_at viejo y el salón mostraba "18 h" en una mesa vacía.
+        if self.status == "available":
+            self.seated_at = None
+            self.waiter = ""
+            fields = kwargs.get("update_fields")
+            if fields is not None:
+                kwargs["update_fields"] = list(set(fields) | {"seated_at", "waiter"})
+        super().save(*args, **kwargs)
+
 
 class Order(TenantScoped):
     CHANNEL = [("dine_in", "Mesa"), ("takeaway", "Para llevar"), ("delivery", "Domicilio"), ("web", "Web")]
