@@ -289,9 +289,16 @@ class OrderSerializer(serializers.ModelSerializer):
                 {"product": ln.product.name, "quantity": ln.quantity, "unit_price": str(ln.unit_price), "notes": ln.notes}
                 for ln in instance.lines.all()
             ]
+            prev_pairs = [(ln.product, ln.quantity) for ln in instance.lines.select_related("product").all()]
             instance.lines.all().delete()
             for line_data in lines_data:
                 models.OrderLine.objects.create(order=instance, **line_data)
+            # Si el pedido ya había descontado inventario, la edición mueve solo
+            # la diferencia: antes se agregaban cervezas a una cuenta abierta y
+            # el kardex se quedaba con las del primer envío.
+            if instance.stock_consumed:
+                from .views import adjust_consumed_order
+                adjust_consumed_order(instance, prev_pairs)
             after = [
                 {"product": ln.product.name, "quantity": ln.quantity, "unit_price": str(ln.unit_price), "notes": ln.notes}
                 for ln in instance.lines.all()

@@ -229,6 +229,9 @@ class Product(TenantScoped):
     # preparar, y obligarla a recorrer el KDS hacía que el mesero tuviera que ir
     # a marcarla listo para poder entregarla.
     needs_preparation = models.BooleanField(default=True)
+    # Un producto con ventas no se puede borrar de verdad (las líneas de pedido
+    # lo referencian); se archiva y desaparece de la carta y del POS.
+    archived = models.BooleanField(default=False, db_index=True)
     # Producto que ES un insumo del inventario: una cerveza, una cajetilla, una
     # botella. Se vendían sin mover el kardex porque descontar exigía montarles
     # una "receta" de un solo ingrediente, y nadie lo hacía.

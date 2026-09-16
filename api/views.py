@@ -359,6 +359,26 @@ def consume_order_inventory(order):
     broadcast_inventory(order.tenant_id, items, movements)
 
 
+def adjust_consumed_order(order, prev_pairs):
+    """
+    Pedido ya descontado al que le cambiaron las líneas: descuenta lo que se
+    agregó y devuelve lo que se quitó, producto por producto.
+    """
+    before = expand_products(prev_pairs)
+    after = expand_products((ln.product, ln.quantity) for ln in order.lines.select_related("product").all())
+    more = {pid: after[pid] - before.get(pid, 0) for pid in after if after[pid] > before.get(pid, 0)}
+    less = {pid: before[pid] - after.get(pid, 0) for pid in before if before[pid] > after.get(pid, 0)}
+    touched, movements = [], []
+    if more:
+        t, m = consume_recipe_demand(order.tenant, more, f"Venta · Orden {order.code}")
+        touched += t; movements += m
+    if less:
+        t, m = consume_recipe_demand(order.tenant, less, f"Ajuste · Orden {order.code}", restore=True)
+        touched += t; movements += m
+    if touched:
+        broadcast_inventory(order.tenant_id, touched, movements)
+
+
 def sync_products_availability(item_ids):
     """
     Sincroniza la disponibilidad ("Agotado") de los productos cuya receta usa
@@ -511,6 +531,24 @@ class ProductViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Product.objects.select_related("category").prefetch_related("combo_items__product", "recipes")
     serializer_class = serializers.ProductSerializer
 
+    def get_queryset(self):
+        return super().get_queryset().filter(archived=False)
+
+    def perform_destroy(self, product):
+        """
+        Borrar: si nada lo referencia, se elimina; si ya se vendió (líneas de
+        pedido lo apuntan con PROTECT), se archiva. Antes el DELETE devolvía
+        500 y "no se dejaba eliminar".
+        """
+        from django.db.models import ProtectedError
+        try:
+            with transaction.atomic():
+                product.delete()
+        except ProtectedError:
+            product.archived = True
+            product.available = False
+            product.save(update_fields=["archived", "available"])
+
 
 class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.InventoryItem.objects.all()
@@ -579,6 +617,51 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
         broadcast_inventory(tenant_id, items, movements)
         return response.Response({
             "items": serializers.InventoryItemSerializer(items, many=True).data,
+            "movements": serializers.InventoryMovementSerializer(movements, many=True).data,
+        })
+
+    @decorators.action(detail=False, methods=["get", "post"], url_path="physical-count")
+    def physical_count(self, request):
+        """
+        Conteo físico en una sola llamada y una sola transacción:
+        `{"adjustments": [{"id", "stock"}], "reason"}`. Antes el cliente
+        disparaba un POST por insumo sin esperar respuesta; si uno fallaba o
+        la página cambiaba, el conteo quedaba a medias sin aviso.
+        GET devuelve [] (no se guardan conteos como tal, solo sus ajustes).
+        """
+        if request.method == "GET":
+            return response.Response([])
+        adjustments = request.data.get("adjustments") or []
+        reason = (request.data.get("reason") or "Conteo físico").strip()[:120]
+        by_id = {str(a.get("id")): a.get("stock") for a in adjustments if a.get("id") is not None}
+        if not by_id:
+            return response.Response({"error": "Sin ajustes."}, status=status.HTTP_400_BAD_REQUEST)
+        touched, movements = [], []
+        with transaction.atomic():
+            items = self.get_queryset().select_for_update().filter(id__in=list(by_id.keys()))
+            for item in items:
+                try:
+                    new_stock = max(float(by_id[str(item.id)]), 0.0)
+                except (TypeError, ValueError):
+                    continue
+                delta = round(new_stock - float(item.stock), 3)
+                if abs(delta) < 0.0005:
+                    continue
+                item.stock = new_stock
+                item.recompute_status()
+                item.save()
+                movements.append(models.InventoryMovement.objects.create(
+                    tenant=item.tenant, item=item,
+                    type="salida" if delta < 0 else "ajuste",
+                    quantity=delta, balance=item.stock, unit_cost=item.cost, reason=reason,
+                ))
+                touched.append(item)
+        if touched:
+            sync_products_availability([it.id for it in touched])
+            broadcast_inventory(touched[0].tenant_id, touched, movements)
+        return response.Response({
+            "applied": len(touched),
+            "items": serializers.InventoryItemSerializer(touched, many=True).data,
             "movements": serializers.InventoryMovementSerializer(movements, many=True).data,
         })
 
@@ -1960,7 +2043,7 @@ class PublicMenuView(drf_views.APIView):
         if tenant.effective_features().get("website") is not True:
             return response.Response({"error": "Restaurante no encontrado"}, status=status.HTTP_404_NOT_FOUND)
         cats = models.Category.objects.filter(tenant=tenant)
-        products = (models.Product.objects.filter(tenant=tenant, available=True)
+        products = (models.Product.objects.filter(tenant=tenant, available=True, archived=False)
                     .select_related("category").prefetch_related("combo_items__product", "recipes"))
         tables = models.Table.objects.filter(tenant=tenant).values("id", "number")
         return response.Response({
