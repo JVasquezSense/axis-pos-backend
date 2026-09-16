@@ -232,10 +232,11 @@ class OrderLineSerializer(serializers.ModelSerializer):
     )
     product = ProductSerializer(read_only=True)
     unitPrice = serializers.DecimalField(source="unit_price", max_digits=12, decimal_places=2)
+    variationId = serializers.CharField(source="variation_id", required=False, allow_blank=True, default="")
 
     class Meta:
         model = models.OrderLine
-        fields = ["id", "productId", "product", "quantity", "notes", "unitPrice"]
+        fields = ["id", "productId", "product", "quantity", "notes", "unitPrice", "variationId"]
 
 
 class OrderSerializer(serializers.ModelSerializer):
@@ -289,7 +290,7 @@ class OrderSerializer(serializers.ModelSerializer):
                 {"product": ln.product.name, "quantity": ln.quantity, "unit_price": str(ln.unit_price), "notes": ln.notes}
                 for ln in instance.lines.all()
             ]
-            prev_pairs = [(ln.product, ln.quantity) for ln in instance.lines.select_related("product").all()]
+            prev_pairs = [(ln.product, ln.quantity, ln.variation_id) for ln in instance.lines.select_related("product").all()]
             instance.lines.all().delete()
             for line_data in lines_data:
                 models.OrderLine.objects.create(order=instance, **line_data)

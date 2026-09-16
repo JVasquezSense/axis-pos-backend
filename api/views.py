@@ -48,23 +48,59 @@ def resolve_tenant_features(user):
         return None
 
 
+def demand_key(product_id, variation_id=""):
+    """Clave de demanda: el producto, o (producto, variación) si la hay."""
+    return (product_id, variation_id) if variation_id else product_id
+
+
+def split_key(key):
+    return key if isinstance(key, tuple) else (key, "")
+
+
 def expand_products(pairs):
     """
-    Expande (producto, cantidad) resolviendo combos en sus componentes.
+    Expande (producto, cantidad[, variación]) resolviendo combos en sus
+    componentes.
 
-    Devuelve {product_id: cantidad_total} solo con productos reales (no combos),
-    que son los que tienen receta y por tanto descuentan inventario.
+    Devuelve {clave: cantidad_total} solo con productos reales (no combos).
+    La clave es el id del producto o (id, variación) cuando la línea pidió
+    una variación: una variación puede descontar otro insumo.
     """
     demand = {}
-    for product, qty in pairs:
+    for entry in pairs:
+        product, qty = entry[0], entry[1]
+        variation = entry[2] if len(entry) > 2 and entry[2] else ""
         if product is None or qty is None:
             continue
         if getattr(product, "is_combo", False):
             for ci in product.combo_items.select_related("product").all():
                 demand[ci.product_id] = demand.get(ci.product_id, 0) + ci.quantity * float(qty)
         else:
-            demand[product.id] = demand.get(product.id, 0) + float(qty)
+            key = demand_key(product.id, variation)
+            demand[key] = demand.get(key, 0) + float(qty)
     return demand
+
+
+def variation_supply(product, variation_id):
+    """
+    Qué descuenta una variación de un producto simple:
+      (item_id, qty)  → insumo propio
+      None            → usa el insumo estándar del producto
+      (None, 0)       → esta variación no descuenta nada
+    """
+    for v in product.variations or []:
+        if str(v.get("id")) != str(variation_id):
+            continue
+        if v.get("useDefaultSupply", True):
+            return None
+        inv = v.get("inventoryId")
+        if not inv:
+            return (None, 0)
+        try:
+            return (int(inv), float(v.get("inventoryQty") or 1))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 ACTIVE_ORDER_STATUSES = ("pending", "preparing", "ready", "served")
@@ -248,13 +284,11 @@ def consume_recipe_demand(tenant, demand, reason, restore=False):
     # Cada producto declara cómo consume: el simple descuenta el insumo que ES,
     # el compuesto los de su ficha técnica. Deducirlo de "tiene receta o no"
     # dejaba sin descontar a todo lo que se vende tal cual sin ficha.
-    simple = {
-        p.id: p
-        for p in models.Product.objects.filter(
-            id__in=demand.keys(), kind="simple", inventory_item__isnull=False
-        )
-    }
-    compound_ids = [pid for pid in demand if pid not in simple]
+    product_ids = {split_key(k)[0] for k in demand}
+    # Un simple con variación de insumo propio también entra aquí aunque no
+    # tenga insumo estándar: la variación trae el suyo.
+    simple = {p.id: p for p in models.Product.objects.filter(id__in=product_ids, kind="simple")}
+    compound_ids = [pid for pid in product_ids if pid not in simple]
     recipes = {
         r.product_id: r
         for r in models.Recipe.objects.filter(product_id__in=compound_ids).prefetch_related("ingredients")
@@ -267,17 +301,23 @@ def consume_recipe_demand(tenant, demand, reason, restore=False):
         for ing in recipe.ingredients.all():
             if ing.item_id is not None:
                 ingredient_ids.add(ing.item_id)
-    ingredient_ids.update(p.inventory_item_id for p in simple.values())
+    ingredient_ids.update(p.inventory_item_id for p in simple.values() if p.inventory_item_id)
     # Los insumos se necesitan ANTES de calcular: la conversión depende de la
     # unidad en la que el restaurante lleva cada uno.
     units = {it.id: it for it in models.InventoryItem.objects.filter(id__in=ingredient_ids)}
 
-    for product_id, qty in demand.items():
+    for key, qty in demand.items():
+        product_id, variation_id = split_key(key)
         product = simple.get(product_id)
         if product is not None:
-            consumed = float(product.inventory_qty or 1) * float(qty)
-            key = product.inventory_item_id
-            consumption[key] = consumption.get(key, 0) + consumed
+            item_id, per_unit = product.inventory_item_id, float(product.inventory_qty or 1)
+            if variation_id:
+                override = variation_supply(product, variation_id)
+                if override is not None:
+                    item_id, per_unit = override
+            if not item_id:
+                continue
+            consumption[item_id] = consumption.get(item_id, 0) + per_unit * float(qty)
             continue
         recipe = recipes.get(product_id)
         if not recipe:
@@ -350,7 +390,7 @@ def consume_order_inventory(order):
 
     # Un combo no tiene receta propia: se expande en sus componentes para que
     # descuenten el inventario de cada uno.
-    demand = expand_products(((ln.product, ln.quantity) for ln in lines))
+    demand = expand_products(((ln.product, ln.quantity, ln.variation_id) for ln in lines))
 
     items, movements = consume_recipe_demand(order.tenant, demand, f"Venta · Orden {order.code}")
 
@@ -365,7 +405,7 @@ def adjust_consumed_order(order, prev_pairs):
     agregó y devuelve lo que se quitó, producto por producto.
     """
     before = expand_products(prev_pairs)
-    after = expand_products((ln.product, ln.quantity) for ln in order.lines.select_related("product").all())
+    after = expand_products((ln.product, ln.quantity, ln.variation_id) for ln in order.lines.select_related("product").all())
     more = {pid: after[pid] - before.get(pid, 0) for pid in after if after[pid] > before.get(pid, 0)}
     less = {pid: before[pid] - after.get(pid, 0) for pid in before if before[pid] > after.get(pid, 0)}
     touched, movements = [], []
@@ -1337,7 +1377,7 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
                     continue
                 if order.stock_consumed:
                     demand = expand_products(
-                        ((ln.product, ln.quantity) for ln in order.lines.select_related("product").all())
+                        ((ln.product, ln.quantity, ln.variation_id) for ln in order.lines.select_related("product").all())
                     )
                     t, m = consume_recipe_demand(sale.tenant, demand, reason, restore=True)
                     touched += t; movements += m

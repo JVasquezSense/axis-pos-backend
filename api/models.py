@@ -399,6 +399,9 @@ class OrderLine(models.Model):
     quantity = models.PositiveIntegerField(default=1)
     notes = models.CharField(max_length=200, blank=True)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    # Id de la variación elegida (Product.variations[].id). Una variación de un
+    # producto simple puede descontar otro insumo distinto del estándar.
+    variation_id = models.CharField(max_length=40, blank=True, default="")
 
 
 class OrderChangeLog(TenantScoped):
