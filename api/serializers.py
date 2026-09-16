@@ -434,11 +434,13 @@ class PurchaseLineSerializer(serializers.ModelSerializer):
     )
     unitCost = serializers.DecimalField(source="unit_cost", max_digits=12, decimal_places=2)
     taxRate = serializers.DecimalField(source="tax_rate", max_digits=5, decimal_places=2, required=False, default=0)
+    bonusQty = serializers.DecimalField(source="bonus_qty", max_digits=12, decimal_places=3, required=False, default=0)
+    discount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=0)
     name = serializers.CharField(source="inventory_item.name", read_only=True)
 
     class Meta:
         model = models.PurchaseLine
-        fields = ["id", "inventoryId", "name", "quantity", "unit", "unitCost", "taxRate"]
+        fields = ["id", "inventoryId", "name", "quantity", "unit", "unitCost", "taxRate", "bonusQty", "discount"]
 
 
 class PurchaseSerializer(serializers.ModelSerializer):
@@ -470,19 +472,28 @@ class PurchaseSerializer(serializers.ModelSerializer):
             pl = models.PurchaseLine.objects.create(
                 purchase=purchase, inventory_item=inv_item, **line_data
             )
-            # Actualiza stock en inventario y crea movimiento
-            inv_item.stock = float(inv_item.stock) + float(pl.quantity)
+            # Entra lo comprado más lo regalado; el costo del movimiento es el
+            # real por unidad: (pagado − descuento) / (compradas + cortesía).
+            units_in = float(pl.quantity) + float(pl.bonus_qty or 0)
+            paid = float(pl.quantity) * float(pl.unit_cost) - float(pl.discount or 0)
+            effective_cost = round(max(paid, 0) / units_in, 2) if units_in > 0 else float(pl.unit_cost)
+            inv_item.stock = float(inv_item.stock) + units_in
             inv_item.recompute_status()
             inv_item.save()
             affected_item_ids.append(inv_item.id)
+            note = ""
+            if float(pl.bonus_qty or 0) > 0:
+                note += f" · {float(pl.bonus_qty):g} de cortesía"
+            if float(pl.discount or 0) > 0:
+                note += f" · desc. ${float(pl.discount):,.0f}"
             movements.append(models.InventoryMovement.objects.create(
                 tenant=purchase.tenant,
                 item=inv_item,
                 type="entrada",
-                quantity=pl.quantity,
+                quantity=units_in,
                 balance=inv_item.stock,
-                unit_cost=pl.unit_cost,
-                reason=f"Compra {purchase.code} · {purchase.supplier.name}",
+                unit_cost=effective_cost,
+                reason=f"Compra {purchase.code} · {purchase.supplier.name}{note}",
             ))
             touched.append(inv_item)
         # Una compra sube stock: puede reactivar productos que estaban "Agotado".
@@ -608,7 +619,7 @@ class SaleSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Sale
         fields = ["id", "total", "subtotal", "tax", "discount", "items", "method", "saleType",
-                  "table", "tip", "waiter", "customer", "observations", "invoiceNumber", "ts",
+                  "table", "tip", "courtesy", "waiter", "customer", "observations", "invoiceNumber", "ts",
                   "orderIds", "consumedLines", "orderCodes", "lines", "taxes"]
         read_only_fields = ["ts", "invoiceNumber"]
 

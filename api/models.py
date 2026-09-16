@@ -470,6 +470,10 @@ class PurchaseLine(models.Model):
     unit_cost = models.DecimalField(max_digits=12, decimal_places=2)  # costo antes de IVA
     tax_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)  # % IVA/impuesto de esta línea
     unit = models.CharField(max_length=16, blank=True)
+    # El proveedor regala unidades ("12 + 1") o rebaja la línea: las de cortesía
+    # entran al stock sin costo y el descuento baja lo pagado.
+    bonus_qty = models.DecimalField(max_digits=12, decimal_places=3, default=0)
+    discount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
 
 
 # ─── Reservaciones ───────────────────────────────────────────────────────────
@@ -534,6 +538,7 @@ class Sale(TenantScoped):
         ("card", "Tarjeta"), ("cash", "Efectivo"),
         ("transfer", "Transferencia"), ("nequi", "Nequi"),
         ("daviplata", "Daviplata"), ("pse", "PSE"),
+        ("courtesy", "Cortesía"),
     ]
     total = models.DecimalField(max_digits=14, decimal_places=2)
     subtotal = models.DecimalField(max_digits=14, decimal_places=2, default=0)
@@ -544,6 +549,9 @@ class Sale(TenantScoped):
     sale_type = models.CharField(max_length=80, blank=True)
     table_number = models.PositiveIntegerField(null=True, blank=True)
     tip = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    # Lo que la casa invitó: líneas de cortesía o el ticket entero. Suma en el
+    # inventario (se consumió) pero no en la caja.
+    courtesy = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     waiter = models.CharField(max_length=80, blank=True)
     customer = models.CharField(max_length=120, blank=True)
     observations = models.CharField(max_length=300, blank=True)
