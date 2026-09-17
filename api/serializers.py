@@ -429,14 +429,32 @@ class SupplierSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "contact", "phone", "email", "category", "nit", "active"]
 
 
+class MoneyField(serializers.DecimalField):
+    """
+    Decimal que redondea ANTES de validar la precisión. DRF cuenta los dígitos
+    del valor crudo: 6999.9900000001 (ruido de coma flotante del cliente)
+    tiene más de 14 y la compra entera se rechazaba con "Asegúrese de que no
+    haya más de 14 dígitos".
+    """
+    def to_internal_value(self, data):
+        from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+        try:
+            q = Decimal(1).scaleb(-(self.decimal_places or 0))
+            data = Decimal(str(data)).quantize(q, rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+        return super().to_internal_value(data)
+
+
 class PurchaseLineSerializer(serializers.ModelSerializer):
     inventoryId = serializers.PrimaryKeyRelatedField(
         source="inventory_item", queryset=models.InventoryItem.objects.all()
     )
-    unitCost = serializers.DecimalField(source="unit_cost", max_digits=12, decimal_places=2)
-    taxRate = serializers.DecimalField(source="tax_rate", max_digits=5, decimal_places=2, required=False, default=0)
-    bonusQty = serializers.DecimalField(source="bonus_qty", max_digits=12, decimal_places=3, required=False, default=0)
-    discount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, default=0)
+    quantity = MoneyField(max_digits=12, decimal_places=3)
+    unitCost = MoneyField(source="unit_cost", max_digits=12, decimal_places=2)
+    taxRate = MoneyField(source="tax_rate", max_digits=5, decimal_places=2, required=False, default=0)
+    bonusQty = MoneyField(source="bonus_qty", max_digits=12, decimal_places=3, required=False, default=0)
+    discount = MoneyField(max_digits=12, decimal_places=2, required=False, default=0)
     name = serializers.CharField(source="inventory_item.name", read_only=True)
 
     class Meta:
@@ -451,7 +469,9 @@ class PurchaseSerializer(serializers.ModelSerializer):
     )
     supplierName = serializers.CharField(source="supplier.name", read_only=True)
     invoicePhoto = serializers.CharField(source="invoice_photo", required=False, allow_blank=True, default="")
-    taxTotal = serializers.DecimalField(source="tax_total", max_digits=14, decimal_places=2, required=False, default=0)
+    subtotal = MoneyField(max_digits=14, decimal_places=2, required=False, default=0)
+    total = MoneyField(max_digits=14, decimal_places=2, required=False, default=0)
+    taxTotal = MoneyField(source="tax_total", max_digits=14, decimal_places=2, required=False, default=0)
     invoiceNumber = serializers.CharField(source="invoice_number", required=False, allow_blank=True, default="")
     receivedAt = serializers.DateField(source="received_at", required=False, allow_null=True)
     dueDate = serializers.DateField(source="due_date", required=False, allow_null=True)
