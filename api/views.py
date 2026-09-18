@@ -2,7 +2,10 @@
 ViewSets DRF. Cada uno filtra por el tenant del usuario autenticado
 (aislamiento multi-tenant) y mapea a los endpoints que el frontend ya llama.
 """
+import json
+from collections import defaultdict
 from rest_framework import viewsets, decorators, response, status, views as drf_views, permissions
+from rest_framework.renderers import JSONRenderer
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.db.models import Sum, Count, F
@@ -272,7 +275,7 @@ def product_supplies(product_ids):
     return out
 
 
-def consume_recipe_demand(tenant, demand, reason, restore=False):
+def consume_recipe_demand(tenant, demand, reason, restore=False, table_number=None, waiter=""):
     """
     Descuenta del inventario los insumos que exige `demand` ({product_id: cantidad}),
     cruzando cada producto con su receta. Devuelve (items_afectados, movimientos).
@@ -354,6 +357,8 @@ def consume_recipe_demand(tenant, demand, reason, restore=False):
             balance=item.stock,
             unit_cost=item.cost,
             reason=reason,
+            table_number=table_number,
+            waiter=waiter,
         ))
         touched.append(item)
 
@@ -378,7 +383,7 @@ def consume_order_inventory(order):
     """
     # Candado de fila: "preparing" y "ready" pueden llegar casi a la vez desde
     # dos pantallas y duplicar los movimientos del kardex.
-    locked = models.Order.objects.select_for_update().filter(pk=order.pk).first()
+    locked = models.Order.objects.select_for_update().select_related("table").filter(pk=order.pk).first()
     if locked is None or locked.stock_consumed:
         return
     order = locked
@@ -392,7 +397,11 @@ def consume_order_inventory(order):
     # descuenten el inventario de cada uno.
     demand = expand_products(((ln.product, ln.quantity, ln.variation_id) for ln in lines))
 
-    items, movements = consume_recipe_demand(order.tenant, demand, f"Venta · Orden {order.code}")
+    items, movements = consume_recipe_demand(
+        order.tenant, demand, f"Venta · Orden {order.code}",
+        table_number=order.table.number if order.table else None,
+        waiter=(order.table.waiter if order.table else "") or "",
+    )
 
     order.stock_consumed = True
     order.save(update_fields=["stock_consumed"])
@@ -409,11 +418,13 @@ def adjust_consumed_order(order, prev_pairs):
     more = {pid: after[pid] - before.get(pid, 0) for pid in after if after[pid] > before.get(pid, 0)}
     less = {pid: before[pid] - after.get(pid, 0) for pid in before if before[pid] > after.get(pid, 0)}
     touched, movements = [], []
+    table_number = order.table.number if order.table else None
+    waiter = (order.table.waiter if order.table else "") or ""
     if more:
-        t, m = consume_recipe_demand(order.tenant, more, f"Venta · Orden {order.code}")
+        t, m = consume_recipe_demand(order.tenant, more, f"Venta · Orden {order.code}", table_number=table_number, waiter=waiter)
         touched += t; movements += m
     if less:
-        t, m = consume_recipe_demand(order.tenant, less, f"Ajuste · Orden {order.code}", restore=True)
+        t, m = consume_recipe_demand(order.tenant, less, f"Ajuste · Orden {order.code}", restore=True, table_number=table_number, waiter=waiter)
         touched += t; movements += m
     if touched:
         broadcast_inventory(order.tenant_id, touched, movements)
@@ -600,7 +611,8 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
         tenant_id = resolve_tenant_id(request.user)
         qs = models.InventoryMovement.objects.filter(item__tenant_id=tenant_id) if tenant_id \
             else models.InventoryMovement.objects.none()
-        return response.Response(serializers.InventoryMovementSerializer(qs, many=True).data)
+        context = {"shift_boundaries": shift_boundaries(tenant_id)} if tenant_id else {}
+        return response.Response(serializers.InventoryMovementSerializer(qs, many=True, context=context).data)
 
     @decorators.action(detail=False, methods=["post"])
     def consume(self, request):
@@ -1334,6 +1346,48 @@ def open_shift_since(tenant_id):
     return last.created_at if last else None
 
 
+def shift_boundaries(tenant_id):
+    """(created_at, number) de cada cierre, ascendente: ubica en qué turno cayó un movimiento del kardex."""
+    return list(
+        models.ShiftClose.objects.filter(tenant_id=tenant_id).order_by("created_at").values_list("created_at", "number")
+    )
+
+
+def recompute_shift_for_timestamp(tenant, ts):
+    """
+    Recalcula el ShiftClose cuya ventana contenía `ts`, tras anular una venta.
+    El turno abierto no se toca aquí: se calcula en vivo desde `Sale` (ver
+    `?shift=open`), así que si `ts` es posterior al último cierre no hay nada
+    que recalcular. Misma lógica que el comando `recompute_shifts`.
+    """
+    sc = models.ShiftClose.objects.filter(tenant=tenant, created_at__gte=ts).order_by("created_at").first()
+    if sc is None:
+        return
+    prev = models.ShiftClose.objects.filter(tenant=tenant, created_at__lt=sc.created_at).order_by("-created_at").first()
+    qs = models.Sale.objects.filter(tenant=tenant, created_at__lte=sc.created_at)
+    if prev is not None:
+        qs = qs.filter(created_at__gt=prev.created_at)
+    sales = list(qs.prefetch_related("orders__lines__product").order_by("-created_at"))
+
+    total = sum(float(s.total) for s in sales)
+    tips = sum(float(s.tip or 0) for s in sales)
+    by_method, by_waiter = defaultdict(float), defaultdict(float)
+    for s in sales:
+        by_method[s.method] += float(s.total) - float(s.tip or 0)
+        if s.tip:
+            by_waiter[s.waiter or "Sin asignar"] += float(s.tip)
+    orders = len(sales)
+
+    sc.sales_total = round(total, 2)
+    sc.orders = orders
+    sc.avg_ticket = round(total / orders) if orders else 0
+    sc.total_tips = round(tips, 2)
+    sc.by_method = {k: round(v, 2) for k, v in by_method.items()}
+    sc.by_waiter = {k: round(v, 2) for k, v in by_waiter.items()}
+    sc.records = [json.loads(JSONRenderer().render(serializers.SaleSerializer(s).data)) for s in sales]
+    sc.save(update_fields=["sales_total", "orders", "avg_ticket", "total_tips", "by_method", "by_waiter", "records"])
+
+
 class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
     queryset = models.Sale.objects.prefetch_related("orders__lines__product").order_by("-created_at")
     serializer_class = serializers.SaleSerializer
@@ -1379,7 +1433,10 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
                     demand = expand_products(
                         ((ln.product, ln.quantity, ln.variation_id) for ln in order.lines.select_related("product").all())
                     )
-                    t, m = consume_recipe_demand(sale.tenant, demand, reason, restore=True)
+                    t, m = consume_recipe_demand(
+                        sale.tenant, demand, reason, restore=True,
+                        table_number=sale.table_number, waiter=sale.waiter,
+                    )
                     touched += t; movements += m
                     order.stock_consumed = False
                 order.status = "cancelled"
@@ -1392,7 +1449,10 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
                 demand = expand_products(
                     ((products.get(str(ln.get("productId"))), ln.get("quantity")) for ln in sale.consumed_lines)
                 )
-                t, m = consume_recipe_demand(sale.tenant, demand, reason, restore=True)
+                t, m = consume_recipe_demand(
+                    sale.tenant, demand, reason, restore=True,
+                    table_number=sale.table_number, waiter=sale.waiter,
+                )
                 touched += t; movements += m
 
             models.AuditLog.objects.create(
@@ -1401,7 +1461,12 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
                 details=f"{sale.invoice_number or sale.id} · ${sale.total} · {sale.method}"
                         + (f" · {len(touched)} insumo(s) reintegrados" if touched else ""),
             )
+            tenant, created_at = sale.tenant, sale.created_at
             sale.delete()
+            # Si la venta ya estaba dentro de un turno cerrado, su cierre quedó
+            # con el snapshot congelado: sin esto, una venta anulada seguía
+            # apareciendo (y sumando) en el historial de turnos para siempre.
+            recompute_shift_for_timestamp(tenant, created_at)
         broadcast_inventory(sale.tenant_id, touched, movements)
 
     def perform_create(self, serializer):

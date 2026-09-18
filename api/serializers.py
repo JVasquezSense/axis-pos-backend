@@ -220,10 +220,25 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
     inventoryId = serializers.PrimaryKeyRelatedField(source="item", read_only=True)
     unitCost = serializers.DecimalField(source="unit_cost", max_digits=12, decimal_places=2)
     date = serializers.DateTimeField(source="created_at", read_only=True)
+    tableNumber = serializers.IntegerField(source="table_number", read_only=True)
+    # Ubica el movimiento en el turno que estaba abierto cuando ocurrió,
+    # usando los cierres del tenant (ver `shift_boundaries` en views.py). Sin
+    # ese contexto (p. ej. el broadcast por WebSocket) queda en None.
+    shiftNumber = serializers.SerializerMethodField()
 
     class Meta:
         model = models.InventoryMovement
-        fields = ["id", "inventoryId", "date", "type", "quantity", "balance", "unitCost", "reason"]
+        fields = ["id", "inventoryId", "date", "type", "quantity", "balance", "unitCost", "reason", "tableNumber", "waiter", "shiftNumber"]
+
+    def get_shiftNumber(self, obj):
+        boundaries = self.context.get("shift_boundaries")
+        if boundaries is None:
+            return None
+        for created_at, number in boundaries:
+            if obj.created_at <= created_at:
+                return number
+        # Después del último cierre: es el turno abierto ahora mismo.
+        return (boundaries[-1][1] + 1) if boundaries else 1
 
 
 class OrderLineSerializer(serializers.ModelSerializer):
