@@ -220,7 +220,15 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
     inventoryId = serializers.PrimaryKeyRelatedField(source="item", read_only=True)
     unitCost = serializers.DecimalField(source="unit_cost", max_digits=12, decimal_places=2)
     date = serializers.DateTimeField(source="created_at", read_only=True)
-    tableNumber = serializers.IntegerField(source="table_number", read_only=True)
+    # Mesa, mesero y factura se RESUELVEN aquí, no se leen del snapshot guardado:
+    # la cocina descuenta el inventario antes de que la caja cobre, así que al
+    # escribir el movimiento todavía no existe ni la factura ni (en pedidos que
+    # no pasan por cocina) el mesero de la mesa. Los campos guardados quedan de
+    # respaldo para el consumo que no cuelga de un pedido.
+    tableNumber = serializers.SerializerMethodField()
+    waiter = serializers.SerializerMethodField()
+    invoiceNumber = serializers.SerializerMethodField()
+    orderCode = serializers.SerializerMethodField()
     # Ubica el movimiento en el turno que estaba abierto cuando ocurrió,
     # usando los cierres del tenant (ver `shift_boundaries` en views.py). Sin
     # ese contexto (p. ej. el broadcast por WebSocket) queda en None.
@@ -228,7 +236,52 @@ class InventoryMovementSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.InventoryMovement
-        fields = ["id", "inventoryId", "date", "type", "quantity", "balance", "unitCost", "reason", "tableNumber", "waiter", "shiftNumber"]
+        fields = [
+            "id", "inventoryId", "date", "type", "quantity", "balance", "unitCost", "reason",
+            "tableNumber", "waiter", "invoiceNumber", "orderCode", "shiftNumber",
+        ]
+
+    def _sale(self, obj):
+        """
+        Venta que cobró el pedido del movimiento. Una cuenta dividida son varias:
+        se toma la primera.
+
+        Se recorre con `next(iter(...))` y no con `.first()`: sobre un
+        prefetch_related, `.first()` clona el queryset para ordenarlo y pierde
+        la caché, una consulta por movimiento.
+        """
+        if obj.order_id is None:
+            return None
+        if not hasattr(obj, "_cached_sale"):
+            obj._cached_sale = next(iter(obj.order.sales.all()), None)
+        return obj._cached_sale
+
+    def get_tableNumber(self, obj):
+        if obj.table_number is not None:
+            return obj.table_number
+        if obj.order_id and obj.order.table_id:
+            return obj.order.table.number
+        sale = self._sale(obj)
+        return sale.table_number if sale else None
+
+    def get_waiter(self, obj):
+        # La venta es la mejor fuente: la caja registra quién atendió. El
+        # snapshot y la mesa quedan de respaldo.
+        sale = self._sale(obj)
+        if sale and sale.waiter:
+            return sale.waiter
+        if obj.waiter:
+            return obj.waiter
+        if obj.order_id and obj.order.table_id:
+            return obj.order.table.waiter or ""
+        return ""
+
+    def get_invoiceNumber(self, obj):
+        sale = self._sale(obj)
+        return (sale.invoice_number or "") if sale else ""
+
+    def get_orderCode(self, obj):
+        return obj.order.code if obj.order_id else ""
 
     def get_shiftNumber(self, obj):
         boundaries = self.context.get("shift_boundaries")

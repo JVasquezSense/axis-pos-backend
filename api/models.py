@@ -299,9 +299,13 @@ class InventoryMovement(TenantScoped):
     balance = models.DecimalField(max_digits=12, decimal_places=3)
     unit_cost = models.DecimalField(max_digits=12, decimal_places=2)
     reason = models.CharField(max_length=200, blank=True)
-    # Snapshot de dónde salió el consumo (venta con mesa): sin esto el kardex
-    # no podía mostrar qué mesa/mesero originó cada salida, solo el texto
-    # libre de `reason`. En blanco para ajustes/conteos, que no vienen de mesa.
+    # Pedido que originó el movimiento. Es la fuente buena de mesa/mesero/factura:
+    # se resuelven al LEER (ver InventoryMovementSerializer), así el kardex
+    # muestra el número de factura aunque la venta se cobre después de que la
+    # cocina descontó el inventario. Nulo en ajustes y conteos físicos.
+    order = models.ForeignKey("Order", null=True, blank=True, on_delete=models.SET_NULL, related_name="inventory_movements")
+    # Respaldo de mesa/mesero para el consumo que no cuelga de un pedido (venta
+    # directa de mostrador) y para no perder el dato si el pedido se borra.
     table_number = models.PositiveIntegerField(null=True, blank=True)
     waiter = models.CharField(max_length=80, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)

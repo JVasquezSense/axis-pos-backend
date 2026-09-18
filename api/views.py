@@ -275,7 +275,7 @@ def product_supplies(product_ids):
     return out
 
 
-def consume_recipe_demand(tenant, demand, reason, restore=False, table_number=None, waiter=""):
+def consume_recipe_demand(tenant, demand, reason, restore=False, table_number=None, waiter="", order=None):
     """
     Descuenta del inventario los insumos que exige `demand` ({product_id: cantidad}),
     cruzando cada producto con su receta. Devuelve (items_afectados, movimientos).
@@ -357,6 +357,7 @@ def consume_recipe_demand(tenant, demand, reason, restore=False, table_number=No
             balance=item.stock,
             unit_cost=item.cost,
             reason=reason,
+            order=order,
             table_number=table_number,
             waiter=waiter,
         ))
@@ -401,6 +402,7 @@ def consume_order_inventory(order):
         order.tenant, demand, f"Venta · Orden {order.code}",
         table_number=order.table.number if order.table else None,
         waiter=(order.table.waiter if order.table else "") or "",
+        order=order,
     )
 
     order.stock_consumed = True
@@ -421,10 +423,10 @@ def adjust_consumed_order(order, prev_pairs):
     table_number = order.table.number if order.table else None
     waiter = (order.table.waiter if order.table else "") or ""
     if more:
-        t, m = consume_recipe_demand(order.tenant, more, f"Venta · Orden {order.code}", table_number=table_number, waiter=waiter)
+        t, m = consume_recipe_demand(order.tenant, more, f"Venta · Orden {order.code}", table_number=table_number, waiter=waiter, order=order)
         touched += t; movements += m
     if less:
-        t, m = consume_recipe_demand(order.tenant, less, f"Ajuste · Orden {order.code}", restore=True, table_number=table_number, waiter=waiter)
+        t, m = consume_recipe_demand(order.tenant, less, f"Ajuste · Orden {order.code}", restore=True, table_number=table_number, waiter=waiter, order=order)
         touched += t; movements += m
     if touched:
         broadcast_inventory(order.tenant_id, touched, movements)
@@ -609,8 +611,14 @@ class InventoryViewSet(TenantQuerySet, viewsets.ModelViewSet):
     @decorators.action(detail=False, methods=["get"])
     def movements(self, request):
         tenant_id = resolve_tenant_id(request.user)
-        qs = models.InventoryMovement.objects.filter(item__tenant_id=tenant_id) if tenant_id \
-            else models.InventoryMovement.objects.none()
+        # El serializer resuelve mesa/mesero/factura desde el pedido y su venta:
+        # sin estos joins cada movimiento dispararía sus propias consultas.
+        qs = (
+            models.InventoryMovement.objects
+            .filter(item__tenant_id=tenant_id)
+            .select_related("order", "order__table")
+            .prefetch_related("order__sales")
+        ) if tenant_id else models.InventoryMovement.objects.none()
         context = {"shift_boundaries": shift_boundaries(tenant_id)} if tenant_id else {}
         return response.Response(serializers.InventoryMovementSerializer(qs, many=True, context=context).data)
 
@@ -853,6 +861,17 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
         tenant_id = self._resolve_tenant_id()
         order = serializer.save(tenant_id=tenant_id) if tenant_id else serializer.save()
 
+        # Quién marcó la mesa: el usuario que tomó el primer pedido. Antes la
+        # mesa quedaba sin encargado (o con "" cuando el cliente la ocupaba).
+        #
+        # Va ANTES de descontar el inventario: un pedido que no pasa por cocina
+        # (una botella, una cajetilla) se consume aquí mismo, y si el mesero
+        # todavía no estaba asignado el movimiento del kardex nacía sin él.
+        if order.table and not (order.table.waiter or "").strip() and self.request.user.is_authenticated:
+            user = self.request.user
+            order.table.waiter = user.get_full_name().strip() or user.username
+            order.table.save(update_fields=["waiter"])
+
         # Pedido que no tiene nada que preparar (una ronda de cervezas, una
         # cajetilla): nace listo. Recorrer el KDS para nada obligaba al mesero a
         # ir a marcarlo antes de poder entregarlo.
@@ -867,12 +886,6 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
             except Exception:
                 pass
 
-        # Quién marcó la mesa: el usuario que tomó el primer pedido. Antes la
-        # mesa quedaba sin encargado (o con "" cuando el cliente la ocupaba).
-        if order.table and not (order.table.waiter or "").strip() and self.request.user.is_authenticated:
-            user = self.request.user
-            order.table.waiter = user.get_full_name().strip() or user.username
-            order.table.save(update_fields=["waiter"])
         sync_table_status(order.table)
         # Empuja ticket a cocina vía WebSocket
         try:
@@ -1435,7 +1448,7 @@ class SaleViewSet(TenantQuerySet, viewsets.ModelViewSet):
                     )
                     t, m = consume_recipe_demand(
                         sale.tenant, demand, reason, restore=True,
-                        table_number=sale.table_number, waiter=sale.waiter,
+                        table_number=sale.table_number, waiter=sale.waiter, order=order,
                     )
                     touched += t; movements += m
                     order.stock_consumed = False
