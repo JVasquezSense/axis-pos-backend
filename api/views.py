@@ -3,6 +3,7 @@ ViewSets DRF. Cada uno filtra por el tenant del usuario autenticado
 (aislamiento multi-tenant) y mapea a los endpoints que el frontend ya llama.
 """
 import json
+import logging
 from collections import defaultdict
 from rest_framework import viewsets, decorators, response, status, views as drf_views, permissions
 from rest_framework.renderers import JSONRenderer
@@ -14,6 +15,8 @@ from django.utils import timezone
 from django.db import transaction
 from datetime import date, timedelta
 from . import models, serializers
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_tenant_id(user):
@@ -384,7 +387,12 @@ def consume_order_inventory(order):
     """
     # Candado de fila: "preparing" y "ready" pueden llegar casi a la vez desde
     # dos pantallas y duplicar los movimientos del kardex.
-    locked = models.Order.objects.select_for_update().select_related("table").filter(pk=order.pk).first()
+    #
+    # SIN select_related("table"): `Order.table` es nulable, así que el join que
+    # genera es un LEFT OUTER JOIN y Postgres rechaza un SELECT ... FOR UPDATE
+    # sobre el lado nulable de un outer join. El error caía en el `except` que
+    # envuelve a esta función y el inventario dejaba de descontarse en silencio.
+    locked = models.Order.objects.select_for_update().filter(pk=order.pk).first()
     if locked is None or locked.stock_consumed:
         return
     order = locked
@@ -884,7 +892,9 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
                 with transaction.atomic():
                     consume_order_inventory(order)
             except Exception:
-                pass
+                # Nunca tumba el pedido, pero SÍ deja traza: un fallo aquí deja
+                # de descontar el inventario y en silencio es invisible.
+                logger.exception("No se pudo descontar el inventario del pedido %s", order.code)
 
         sync_table_status(order.table)
         # Empuja ticket a cocina vía WebSocket
@@ -908,7 +918,7 @@ class OrderViewSet(TenantQuerySet, viewsets.ModelViewSet):
                 with transaction.atomic():
                     consume_order_inventory(order)
             except Exception:
-                pass
+                logger.exception("No se pudo descontar el inventario del pedido %s", order.code)
         # Cobrar o cancelar el último pedido de la mesa la deja libre sola.
         sync_table_status(order.table)
 
@@ -2327,7 +2337,7 @@ class PublicOrderView(drf_views.APIView):
                 with transaction.atomic():
                     consume_order_inventory(order)
             except Exception:
-                pass
+                logger.exception("No se pudo descontar el inventario del pedido web %s", order.code)
 
         # Ocupar la mesa es parte de tomar el pedido, no un detalle del POS.
         sync_table_status(order.table)
